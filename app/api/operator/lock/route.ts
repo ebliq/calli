@@ -3,9 +3,16 @@ import { connectDB } from "@/lib/mongodb";
 import { Settings } from "@/lib/models/settings";
 import { Operator } from "@/lib/models/operator";
 
-// POST /api/operator/lock — Lock/unlock operator via API key
+// POST /api/operator/lock — Lock/unlock operator via API key (idempotent)
 // Headers: x-api-key: <operatorApiKey>
 // Body: { "locked": true, "lockedBy": "conv_xxx" } or { "locked": false }
+//
+// Lock responses:
+//   status: "blocked"                  — freshly locked by this conversation
+//   status: "already_blocked_same_id"  — already locked by the same conversation ID
+//   status: "already_blocked_other_id" — already locked by a different conversation ID
+//   status: "unlocked"                 — successfully unlocked
+//   status: "already_unlocked"         — was not locked
 export async function POST(req: NextRequest) {
   try {
     const apiKey = req.headers.get("x-api-key");
@@ -34,8 +41,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const updates: Record<string, unknown> = {};
+    // Get current operator state
+    let operator = await Operator.findOne({ userId });
+    if (!operator) {
+      operator = await Operator.create({ userId });
+    }
 
+    // === LOCK ===
     if (body.locked === true) {
       if (!body.lockedBy || typeof body.lockedBy !== "string") {
         return NextResponse.json(
@@ -43,22 +55,61 @@ export async function POST(req: NextRequest) {
           { status: 400 }
         );
       }
-      updates.locked = true;
-      updates.lockedBy = body.lockedBy;
-      updates.lockedAt = new Date();
-    } else {
-      updates.locked = false;
-      updates.lockedBy = null;
-      updates.lockedAt = null;
+
+      // Already locked?
+      if (operator.locked) {
+        if (operator.lockedBy === body.lockedBy) {
+          return NextResponse.json({
+            status: "already_blocked_same_id",
+            lockedBy: operator.lockedBy,
+            lockedAt: operator.lockedAt,
+            data: operator.toJSON(),
+          });
+        } else {
+          return NextResponse.json({
+            status: "already_blocked_other_id",
+            lockedBy: operator.lockedBy,
+            requestedBy: body.lockedBy,
+            lockedAt: operator.lockedAt,
+            data: operator.toJSON(),
+          });
+        }
+      }
+
+      // Lock it
+      operator = await Operator.findOneAndUpdate(
+        { userId },
+        { $set: { locked: true, lockedBy: body.lockedBy, lockedAt: new Date() } },
+        { new: true }
+      );
+
+      return NextResponse.json({
+        status: "blocked",
+        lockedBy: body.lockedBy,
+        data: operator!.toJSON(),
+      });
     }
 
-    const operator = await Operator.findOneAndUpdate(
+    // === UNLOCK ===
+    if (!operator.locked) {
+      return NextResponse.json({
+        status: "already_unlocked",
+        data: operator.toJSON(),
+      });
+    }
+
+    const previousLockedBy = operator.lockedBy;
+    operator = await Operator.findOneAndUpdate(
       { userId },
-      { $set: updates },
-      { new: true, upsert: true, runValidators: true }
+      { $set: { locked: false, lockedBy: null, lockedAt: null } },
+      { new: true }
     );
 
-    return NextResponse.json({ data: operator.toJSON() });
+    return NextResponse.json({
+      status: "unlocked",
+      previousLockedBy,
+      data: operator!.toJSON(),
+    });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Server error" },

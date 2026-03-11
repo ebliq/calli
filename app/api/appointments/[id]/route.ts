@@ -1,14 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { connectDB } from "@/lib/mongodb";
-import { Call } from "@/lib/models/call";
-import { Contact } from "@/lib/models/contact";
+import { Appointment } from "@/lib/models/appointment";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
-// GET /api/calls/:id
+// GET /api/appointments/:id
 export async function GET(_req: NextRequest, { params }: RouteParams) {
   try {
     const { userId } = await auth();
@@ -18,35 +17,14 @@ export async function GET(_req: NextRequest, { params }: RouteParams) {
 
     await connectDB();
     const { id } = await params;
-    const call = await Call.findOne({ _id: id, userId }).lean();
+    const appointment = await Appointment.findOne({ _id: id, userId }).lean();
 
-    if (!call) {
-      return NextResponse.json({ error: "Call not found" }, { status: 404 });
+    if (!appointment) {
+      return NextResponse.json({ error: "Appointment not found" }, { status: 404 });
     }
 
-    const { _id, __v, ...rest } = call as Record<string, unknown>;
-
-    // Look up contact name
-    let contactName: string | undefined;
-    if (rest.contactId) {
-      const contact = await Contact.findById(rest.contactId)
-        .select("firstName lastName")
-        .lean() as Record<string, unknown> | null;
-      if (contact) {
-        contactName = `${contact.firstName ?? ""} ${contact.lastName ?? ""}`.trim();
-      }
-    }
-
-    return NextResponse.json({
-      data: {
-        id: String(_id),
-        ...rest,
-        contactId: rest.contactId ? String(rest.contactId) : null,
-        batchId: rest.batchId ? String(rest.batchId) : null,
-        calliAgentId: rest.calliAgentId ? String(rest.calliAgentId) : null,
-        contactName,
-      },
-    });
+    const { _id, __v, ...rest } = appointment as Record<string, unknown>;
+    return NextResponse.json({ data: { id: String(_id), ...rest } });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Server error" },
@@ -55,7 +33,7 @@ export async function GET(_req: NextRequest, { params }: RouteParams) {
   }
 }
 
-// PATCH /api/calls/:id — Update call status, outcome, transcript, etc.
+// PATCH /api/appointments/:id
 export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try {
     const { userId } = await auth();
@@ -67,33 +45,21 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     const { id } = await params;
     const updates = await req.json();
 
-    // Protect immutable fields
     delete updates.id;
     delete updates._id;
-    delete updates.userId;
     delete updates.createdAt;
 
-    // Auto-set startedAt when transitioning to ringing
-    if (updates.status === "ringing" && !updates.startedAt) {
-      updates.startedAt = new Date();
-    }
-
-    // Auto-set endedAt when call finishes
-    if (["completed", "failed", "transferred"].includes(updates.status) && !updates.endedAt) {
-      updates.endedAt = new Date();
-    }
-
-    const call = await Call.findOneAndUpdate(
+    const appointment = await Appointment.findOneAndUpdate(
       { _id: id, userId },
       { $set: updates },
       { new: true, runValidators: true }
     );
 
-    if (!call) {
-      return NextResponse.json({ error: "Call not found" }, { status: 404 });
+    if (!appointment) {
+      return NextResponse.json({ error: "Appointment not found" }, { status: 404 });
     }
 
-    return NextResponse.json({ data: call.toJSON() });
+    return NextResponse.json({ data: appointment.toJSON() });
   } catch (error) {
     if (error instanceof Error && error.name === "ValidationError") {
       return NextResponse.json({ error: error.message }, { status: 400 });
@@ -105,7 +71,7 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   }
 }
 
-// DELETE /api/calls/:id — Remove a planned call
+// DELETE /api/appointments/:id
 export async function DELETE(_req: NextRequest, { params }: RouteParams) {
   try {
     const { userId } = await auth();
@@ -115,10 +81,10 @@ export async function DELETE(_req: NextRequest, { params }: RouteParams) {
 
     await connectDB();
     const { id } = await params;
-    const call = await Call.findOneAndDelete({ _id: id, userId });
+    const appointment = await Appointment.findOneAndDelete({ _id: id, userId });
 
-    if (!call) {
-      return NextResponse.json({ error: "Call not found" }, { status: 404 });
+    if (!appointment) {
+      return NextResponse.json({ error: "Appointment not found" }, { status: 404 });
     }
 
     return NextResponse.json({ deleted: true });

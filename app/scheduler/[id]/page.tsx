@@ -361,34 +361,40 @@ export default function BatchDetailPage() {
                 {batchStatusBadge(batch.status)}
               </div>
               <div className="flex items-center gap-2">
-                {batch.status === "pending" && (
-                  <Button
-                    size="sm"
-                    onClick={() => handleStatusChange("running")}
-                    className="bg-green-600 hover:bg-green-700 text-white"
-                  >
-                    Starten
-                  </Button>
-                )}
-                {batch.status === "running" && (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => handleStatusChange("paused")}
-                    className="border-yellow-500 text-yellow-600 hover:bg-yellow-50"
-                  >
-                    Pausieren
-                  </Button>
-                )}
-                {batch.status === "paused" && (
-                  <Button
-                    size="sm"
-                    onClick={() => handleStatusChange("running")}
-                    className="bg-orange-500 hover:bg-orange-600 text-white"
-                  >
-                    Fortsetzen
-                  </Button>
-                )}
+                <Select
+                  value={batch.status}
+                  onValueChange={(value) => handleStatusChange(value as BatchDetailDTO["status"])}
+                >
+                  <SelectTrigger className="w-[180px] h-8 text-sm">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="pending">
+                      <span className="flex items-center gap-2">
+                        <span className="h-2 w-2 rounded-full bg-muted-foreground/40" />
+                        Ausstehend
+                      </span>
+                    </SelectItem>
+                    <SelectItem value="running">
+                      <span className="flex items-center gap-2">
+                        <span className="h-2 w-2 rounded-full bg-orange-500" />
+                        Aktiv
+                      </span>
+                    </SelectItem>
+                    <SelectItem value="paused">
+                      <span className="flex items-center gap-2">
+                        <span className="h-2 w-2 rounded-full bg-yellow-500" />
+                        Pausiert
+                      </span>
+                    </SelectItem>
+                    <SelectItem value="completed">
+                      <span className="flex items-center gap-2">
+                        <span className="h-2 w-2 rounded-full bg-green-500" />
+                        Abgeschlossen
+                      </span>
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
             </div>
 

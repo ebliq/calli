@@ -1,20 +1,21 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { SidebarLayout } from "components/sidebar/sidebar-layout";
 import {
-  fetchContact, updateContact as apiUpdateContact, deleteContact as apiDeleteContact,
+  fetchContact,
+  updateContact as apiUpdateContact,
+  deleteContact as apiDeleteContact,
   fetchCustomProperties,
-  type ContactDTO, type CustomPropertyDTO,
+  fetchCalls,
+  fetchCall,
+  type ContactDTO,
+  type CustomPropertyDTO,
+  type CallDTO,
+  type CallDetailDTO,
 } from "@/lib/api-client";
-import {
-  getCallRecords,
-  addCallRecord,
-  generateId,
-} from "@/lib/store";
 import { cn, formatPhoneDisplay } from "@/lib/utils";
-import type { CallRecord } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -24,7 +25,6 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { Separator } from "@/components/ui/separator";
 import {
   Select,
   SelectTrigger,
@@ -49,16 +49,13 @@ import {
   Mail,
   Building2,
   StickyNote,
-  Clock,
   Calendar,
-  ChevronDown,
-  ChevronUp,
   PhoneCall,
   CalendarCheck,
-  PhoneForwarded,
   Pencil,
   Trash2,
   User,
+  ChevronRight,
 } from "lucide-react";
 
 // ---- Status helpers ----
@@ -91,6 +88,7 @@ const outcomeLabels: Record<string, string> = {
 };
 
 const callStatusLabels: Record<string, string> = {
+  planned: "Geplant",
   ringing: "Klingelt",
   "in-progress": "Läuft",
   completed: "Abgeschlossen",
@@ -98,9 +96,18 @@ const callStatusLabels: Record<string, string> = {
   transferred: "Weitergeleitet",
 };
 
+const callStatusColors: Record<string, string> = {
+  planned: "bg-blue-100 text-blue-800 border-blue-200",
+  ringing: "bg-yellow-100 text-yellow-800 border-yellow-200",
+  "in-progress": "bg-orange-100 text-orange-800 border-orange-200",
+  completed: "bg-green-100 text-green-800 border-green-200",
+  failed: "bg-red-100 text-red-800 border-red-200",
+  transferred: "bg-purple-100 text-purple-800 border-purple-200",
+};
+
 // ---- Formatting helpers ----
 
-function formatDate(dateStr?: string) {
+function formatDate(dateStr?: string | null) {
   if (!dateStr) return "--";
   return new Date(dateStr).toLocaleDateString("de-DE", {
     month: "short",
@@ -109,7 +116,7 @@ function formatDate(dateStr?: string) {
   });
 }
 
-function formatDateTime(dateStr?: string) {
+function formatDateTime(dateStr?: string | null) {
   if (!dateStr) return "--";
   return new Date(dateStr).toLocaleString("de-DE", {
     month: "short",
@@ -120,62 +127,23 @@ function formatDateTime(dateStr?: string) {
   });
 }
 
-function formatDuration(seconds?: number) {
+function formatDuration(seconds?: number | null) {
   if (!seconds) return "--";
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
-// ---- Timeline event type ----
-
-interface TimelineEvent {
-  id: string;
-  date: string;
-  type: "call" | "meeting" | "callback";
-  label: string;
-  detail?: string;
+function formatCallTime(secs?: number) {
+  if (secs == null) return "";
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-function buildTimeline(records: CallRecord[]): TimelineEvent[] {
-  const events: TimelineEvent[] = [];
-
-  for (const r of records) {
-    events.push({
-      id: r.id,
-      date: r.startedAt ?? r.createdAt ?? new Date().toISOString(),
-      type: "call",
-      label: `Anruf - ${callStatusLabels[r.status] || r.status}`,
-      detail: r.outcome
-        ? outcomeLabels[r.outcome] || r.outcome
-        : undefined,
-    });
-
-    if (r.meetingBooked && r.meetingDate) {
-      events.push({
-        id: `${r.id}-meeting`,
-        date: r.meetingDate,
-        type: "meeting",
-        label: "Termin vereinbart",
-        detail: `Geplant für ${formatDateTime(r.meetingDate)}`,
-      });
-    }
-
-    if (r.outcome === "callback-requested") {
-      events.push({
-        id: `${r.id}-callback`,
-        date: r.startedAt ?? r.createdAt ?? new Date().toISOString(),
-        type: "callback",
-        label: "Rückruf erbeten",
-        detail: r.summary || undefined,
-      });
-    }
-  }
-
-  events.sort(
-    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
-  );
-  return events;
+function truncate(str: string, max: number) {
+  if (str.length <= max) return str;
+  return str.slice(0, max).trimEnd() + "…";
 }
 
 // ---- Component ----
@@ -188,10 +156,7 @@ export default function ContactDetailPage() {
   const contactId = params.id as string;
 
   const [contact, setContact] = useState<ContactDTO | undefined>(undefined);
-  const [records, setRecords] = useState<CallRecord[]>([]);
-  const [expandedTranscript, setExpandedTranscript] = useState<string | null>(
-    null
-  );
+  const [calls, setCalls] = useState<CallDTO[]>([]);
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
   const [meetingDialogOpen, setMeetingDialogOpen] = useState(false);
   const [meetingDate, setMeetingDate] = useState("");
@@ -199,7 +164,21 @@ export default function ContactDetailPage() {
   const [hasChanges, setHasChanges] = useState(false);
   const [customProps, setCustomProps] = useState<CustomPropertyDTO[]>([]);
 
+  // Call detail dialog
+  const [detailDialogOpen, setDetailDialogOpen] = useState(false);
+  const [selectedCall, setSelectedCall] = useState<CallDetailDTO | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+
   // Load data
+  const loadCalls = useCallback(async () => {
+    try {
+      const callsRes = await fetchCalls({ contactId, limit: 100 });
+      setCalls(callsRes.data);
+    } catch {
+      setCalls([]);
+    }
+  }, [contactId]);
+
   useEffect(() => {
     async function load() {
       try {
@@ -215,8 +194,8 @@ export default function ContactDetailPage() {
       }
     }
     load();
-    setRecords(getCallRecords(contactId));
-  }, [contactId]);
+    loadCalls();
+  }, [contactId, loadCalls]);
 
   async function reload() {
     try {
@@ -224,7 +203,7 @@ export default function ContactDetailPage() {
       setContact(res.data);
       setEditData(res.data);
     } catch {}
-    setRecords(getCallRecords(contactId));
+    await loadCalls();
   }
 
   async function handleSaveEdit() {
@@ -270,15 +249,6 @@ export default function ContactDetailPage() {
   }
 
   async function handleScheduleCall() {
-    const record: CallRecord = {
-      id: generateId(),
-      contactId,
-      startedAt: new Date().toISOString(),
-      status: "ringing",
-      outcome: "callback-requested",
-      summary: "Rückruf geplant",
-    };
-    addCallRecord(record);
     try {
       await apiUpdateContact(contactId, {
         status: "scheduled",
@@ -293,17 +263,6 @@ export default function ContactDetailPage() {
 
   async function handleBookMeeting() {
     if (!meetingDate) return;
-    const record: CallRecord = {
-      id: generateId(),
-      contactId,
-      startedAt: new Date().toISOString(),
-      status: "completed",
-      outcome: "meeting-booked",
-      meetingBooked: true,
-      meetingDate: new Date(meetingDate).toISOString(),
-      summary: `Termin vereinbart für ${formatDateTime(new Date(meetingDate).toISOString())}`,
-    };
-    addCallRecord(record);
     try {
       await apiUpdateContact(contactId, {
         status: "scheduled",
@@ -314,6 +273,21 @@ export default function ContactDetailPage() {
     setMeetingDialogOpen(false);
     setMeetingDate("");
     toast({ title: "Termin gebucht", description: `Termin geplant für ${formatDate(new Date(meetingDate).toISOString())}.` });
+  }
+
+  async function openCallDetail(callId: string) {
+    setDetailDialogOpen(true);
+    setLoadingDetail(true);
+    setSelectedCall(null);
+    try {
+      const res = await fetchCall(callId);
+      setSelectedCall(res.data as CallDetailDTO);
+    } catch {
+      toast({ title: "Fehler beim Laden der Anrufdetails", variant: "destructive" });
+      setDetailDialogOpen(false);
+    } finally {
+      setLoadingDetail(false);
+    }
   }
 
   if (!contact) {
@@ -341,7 +315,12 @@ export default function ContactDetailPage() {
     );
   }
 
-  const timeline = buildTimeline(records);
+  // Sort calls: newest first by startedAt or createdAt
+  const sortedCalls = [...calls].sort((a, b) => {
+    const dateA = new Date(a.startedAt || a.createdAt).getTime();
+    const dateB = new Date(b.startedAt || b.createdAt).getTime();
+    return dateB - dateA;
+  });
 
   return (
     <SidebarLayout defaultOpen={true}>
@@ -551,233 +530,253 @@ export default function ContactDetailPage() {
               </Dialog>
             </div>
 
-            {/* Two-column layout: Call History + Timeline */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              {/* Call History - takes 2 columns */}
-              <div className="lg:col-span-2">
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <Phone className="h-5 w-5 text-orange-500" />
-                      Anrufverlauf
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    {records.length === 0 ? (
-                      <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
-                        <Phone className="h-8 w-8 mb-2 opacity-40" />
-                        <p className="text-sm">
-                          Noch keine Anrufeinträge für diesen Kontakt.
-                        </p>
-                      </div>
-                    ) : (
-                      <div className="space-y-4">
-                        {records
-                          .sort(
-                            (a, b) =>
-                              new Date(b.startedAt ?? b.createdAt ?? 0).getTime() -
-                              new Date(a.startedAt ?? a.createdAt ?? 0).getTime()
-                          )
-                          .map((record) => (
-                            <div
-                              key={record.id}
-                              className="border rounded-lg p-4"
-                            >
-                              {/* Call record header */}
-                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
-                                <div className="flex items-center gap-3">
-                                  <div
-                                    className={cn(
-                                      "flex h-8 w-8 items-center justify-center rounded-full shrink-0",
-                                      record.status === "completed"
-                                        ? "bg-green-100"
-                                        : record.status === "failed"
-                                          ? "bg-red-100"
-                                          : "bg-orange-100"
-                                    )}
-                                  >
-                                    <Phone
-                                      className={cn(
-                                        "h-4 w-4",
-                                        record.status === "completed"
-                                          ? "text-green-600"
-                                          : record.status === "failed"
-                                            ? "text-red-600"
-                                            : "text-orange-600"
-                                      )}
-                                    />
-                                  </div>
-                                  <div>
-                                    <p className="text-sm font-medium">
-                                      {formatDateTime(record.startedAt ?? record.createdAt ?? new Date().toISOString())}
-                                    </p>
-                                    <p className="text-xs text-muted-foreground">
-                                      Dauer:{" "}
-                                      {formatDuration(record.duration)}
-                                    </p>
-                                  </div>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <Badge
-                                    className={cn(
-                                      "text-xs",
-                                      record.status === "completed"
-                                        ? "bg-green-100 text-green-800 border-green-200"
-                                        : record.status === "failed"
-                                          ? "bg-red-100 text-red-800 border-red-200"
-                                          : "bg-orange-100 text-orange-800 border-orange-200"
-                                    )}
-                                  >
-                                    {callStatusLabels[record.status] ||
-                                      record.status}
+            {/* Full-width Call History */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Phone className="h-5 w-5 text-orange-500" />
+                  Anrufverlauf
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {sortedCalls.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
+                    <Phone className="h-8 w-8 mb-2 opacity-40" />
+                    <p className="text-sm">
+                      Noch keine Anrufeinträge für diesen Kontakt.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {sortedCalls.map((call) => (
+                      <button
+                        key={call.id}
+                        onClick={() => openCallDetail(call.id)}
+                        className="w-full text-left border rounded-lg p-4 hover:bg-muted/50 transition-colors cursor-pointer group"
+                      >
+                        <div className="flex items-center gap-4">
+                          {/* Icon */}
+                          <div
+                            className={cn(
+                              "flex h-9 w-9 items-center justify-center rounded-full shrink-0",
+                              call.status === "completed"
+                                ? "bg-green-100"
+                                : call.status === "failed"
+                                  ? "bg-red-100"
+                                  : call.status === "planned"
+                                    ? "bg-blue-100"
+                                    : "bg-orange-100"
+                            )}
+                          >
+                            <Phone
+                              className={cn(
+                                "h-4 w-4",
+                                call.status === "completed"
+                                  ? "text-green-600"
+                                  : call.status === "failed"
+                                    ? "text-red-600"
+                                    : call.status === "planned"
+                                      ? "text-blue-600"
+                                      : "text-orange-600"
+                              )}
+                            />
+                          </div>
+
+                          {/* Main content */}
+                          <div className="flex-1 min-w-0">
+                            <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-3">
+                              <span className="text-sm font-medium">
+                                {formatDateTime(call.startedAt || call.createdAt)}
+                              </span>
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <Badge
+                                  className={cn(
+                                    "text-xs",
+                                    callStatusColors[call.status] || "bg-gray-100 text-gray-800 border-gray-200"
+                                  )}
+                                >
+                                  {callStatusLabels[call.status] || call.status}
+                                </Badge>
+                                {call.outcome && (
+                                  <Badge variant="outline" className="text-xs">
+                                    {outcomeLabels[call.outcome] || call.outcome}
                                   </Badge>
-                                  {record.outcome && (
-                                    <Badge
-                                      variant="outline"
-                                      className="text-xs"
-                                    >
-                                      {outcomeLabels[record.outcome] ||
-                                        record.outcome}
-                                    </Badge>
-                                  )}
-                                  {record.meetingBooked && (
-                                    <Badge className="text-xs bg-green-100 text-green-800 border-green-200">
-                                      Termin vereinbart
-                                    </Badge>
-                                  )}
-                                </div>
+                                )}
+                                {call.duration != null && call.duration > 0 && (
+                                  <span className="text-xs text-muted-foreground">
+                                    {formatDuration(call.duration)}
+                                  </span>
+                                )}
                               </div>
-
-                              {/* Summary */}
-                              {record.summary && (
-                                <p className="text-sm text-muted-foreground mt-2">
-                                  {record.summary}
-                                </p>
-                              )}
-
-                              {/* Meeting date */}
-                              {record.meetingDate && (
-                                <div className="flex items-center gap-1.5 text-sm text-green-700 mt-2">
-                                  <Calendar className="h-3.5 w-3.5" />
-                                  Termin:{" "}
-                                  {formatDateTime(record.meetingDate)}
-                                </div>
-                              )}
-
-                              {/* Expandable transcript */}
-                              {record.transcript && (
-                                <div className="mt-3">
-                                  <button
-                                    onClick={() =>
-                                      setExpandedTranscript(
-                                        expandedTranscript === record.id
-                                          ? null
-                                          : record.id
-                                      )
-                                    }
-                                    className="flex items-center gap-1 text-xs font-medium text-orange-600 hover:text-orange-700 transition-colors"
-                                  >
-                                    {expandedTranscript === record.id ? (
-                                      <ChevronUp className="h-3.5 w-3.5" />
-                                    ) : (
-                                      <ChevronDown className="h-3.5 w-3.5" />
-                                    )}
-                                    {expandedTranscript === record.id
-                                      ? "Transkript ausblenden"
-                                      : "Transkript anzeigen"}
-                                  </button>
-                                  {expandedTranscript === record.id && (
-                                    <div className="mt-2 bg-muted/50 rounded-md p-3 text-sm text-muted-foreground whitespace-pre-wrap font-mono text-xs leading-relaxed">
-                                      {record.transcript}
-                                    </div>
-                                  )}
-                                </div>
-                              )}
                             </div>
-                          ))}
+                            {/* Summary snippet */}
+                            {call.summary && (
+                              <p className="text-sm text-muted-foreground mt-1 truncate">
+                                {truncate(call.summary, 80)}
+                              </p>
+                            )}
+                            {/* Conversation ID */}
+                            {call.conversationId && (
+                              <span className="inline-block text-xs font-mono text-muted-foreground/70 mt-1">
+                                {call.conversationId}
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Chevron */}
+                          <ChevronRight className="h-4 w-4 text-muted-foreground/40 group-hover:text-muted-foreground shrink-0 transition-colors" />
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Call Detail Dialog */}
+            <Dialog open={detailDialogOpen} onOpenChange={setDetailDialogOpen}>
+              <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+                {loadingDetail ? (
+                  <div className="flex items-center justify-center py-12 text-muted-foreground">
+                    <p className="text-sm">Lade Anrufdetails...</p>
+                  </div>
+                ) : selectedCall ? (
+                  <>
+                    <DialogHeader>
+                      <DialogTitle className="flex items-center gap-3">
+                        <Phone className="h-5 w-5 text-orange-500" />
+                        Anrufdetails
+                      </DialogTitle>
+                      <DialogDescription>
+                        {formatDateTime(selectedCall.startedAt || selectedCall.createdAt)}
+                      </DialogDescription>
+                    </DialogHeader>
+
+                    <div className="space-y-5 pt-2">
+                      {/* Status row */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge
+                          className={cn(
+                            "text-xs",
+                            callStatusColors[selectedCall.status] || "bg-gray-100 text-gray-800 border-gray-200"
+                          )}
+                        >
+                          {callStatusLabels[selectedCall.status] || selectedCall.status}
+                        </Badge>
+                        {selectedCall.outcome && (
+                          <Badge variant="outline" className="text-xs">
+                            {outcomeLabels[selectedCall.outcome] || selectedCall.outcome}
+                          </Badge>
+                        )}
+                        {selectedCall.duration != null && selectedCall.duration > 0 && (
+                          <span className="text-sm text-muted-foreground">
+                            Dauer: {formatDuration(selectedCall.duration)}
+                          </span>
+                        )}
+                        {selectedCall.conversationId && (
+                          <Badge variant="secondary" className="text-xs font-mono">
+                            {selectedCall.conversationId}
+                          </Badge>
+                        )}
                       </div>
-                    )}
-                  </CardContent>
-                </Card>
-              </div>
 
-              {/* Timeline - takes 1 column */}
-              <div className="lg:col-span-1">
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <Clock className="h-5 w-5 text-orange-500" />
-                      Zeitverlauf
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    {timeline.length === 0 ? (
-                      <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
-                        <Clock className="h-8 w-8 mb-2 opacity-40" />
-                        <p className="text-sm">Noch keine Ereignisse.</p>
-                      </div>
-                    ) : (
-                      <div className="relative">
-                        {/* Vertical line */}
-                        <div className="absolute left-4 top-0 bottom-0 w-0.5 bg-border" />
+                      {/* Summary */}
+                      {selectedCall.summary && (
+                        <div>
+                          <h4 className="text-sm font-medium mb-1">Zusammenfassung</h4>
+                          <p className="text-sm text-muted-foreground">{selectedCall.summary}</p>
+                        </div>
+                      )}
 
-                        <div className="space-y-6">
-                          {timeline.map((event, idx) => (
-                            <div
-                              key={event.id}
-                              className="relative flex items-start gap-4 pl-1"
-                            >
-                              {/* Icon dot */}
-                              <div
-                                className={cn(
-                                  "relative z-10 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-2 border-background",
-                                  event.type === "call"
-                                    ? "bg-orange-100"
-                                    : event.type === "meeting"
-                                      ? "bg-green-100"
-                                      : "bg-purple-100"
-                                )}
-                              >
-                                {event.type === "call" && (
-                                  <PhoneCall
-                                    className="h-3.5 w-3.5 text-orange-600"
-                                  />
-                                )}
-                                {event.type === "meeting" && (
-                                  <Calendar
-                                    className="h-3.5 w-3.5 text-green-600"
-                                  />
-                                )}
-                                {event.type === "callback" && (
-                                  <Clock
-                                    className="h-3.5 w-3.5 text-purple-600"
-                                  />
-                                )}
-                              </div>
+                      {/* ElevenLabs Transcript */}
+                      {selectedCall.elevenLabsTranscript && selectedCall.elevenLabsTranscript.length > 0 ? (
+                        <div>
+                          <h4 className="text-sm font-medium mb-2">Transkript</h4>
+                          <div className="space-y-2 bg-muted/50 rounded-md p-3 max-h-[300px] overflow-y-auto">
+                            {selectedCall.elevenLabsTranscript.map((entry, idx) => {
+                              const isAgent = entry.role === "agent";
+                              return (
+                                <div key={idx} className="flex gap-2 text-sm">
+                                  {entry.time_in_call_secs != null && (
+                                    <span className="text-xs font-mono text-muted-foreground/60 shrink-0 pt-0.5 w-12 text-right">
+                                      {formatCallTime(entry.time_in_call_secs)}
+                                    </span>
+                                  )}
+                                  <div className="flex-1 min-w-0">
+                                    <span
+                                      className={cn(
+                                        "font-medium text-xs",
+                                        isAgent ? "text-orange-600" : "text-green-600"
+                                      )}
+                                    >
+                                      {isAgent ? "Agent" : "Kontakt"}:
+                                    </span>{" "}
+                                    <span className="text-muted-foreground">{entry.message}</span>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ) : selectedCall.transcript ? (
+                        <div>
+                          <h4 className="text-sm font-medium mb-2">Transkript</h4>
+                          <pre className="text-sm text-muted-foreground bg-muted/50 rounded-md p-3 whitespace-pre-wrap font-mono text-xs leading-relaxed max-h-[300px] overflow-y-auto">
+                            {selectedCall.transcript}
+                          </pre>
+                        </div>
+                      ) : null}
 
-                              {/* Event content */}
-                              <div className="flex-1 min-w-0 pt-0.5">
-                                <p className="text-sm font-medium leading-tight">
-                                  {event.label}
-                                </p>
-                                <p className="text-xs text-muted-foreground mt-0.5">
-                                  {formatDateTime(event.date)}
-                                </p>
-                                {event.detail && (
-                                  <p className="text-xs text-muted-foreground mt-1">
-                                    {event.detail}
+                      {/* ElevenLabs Summary */}
+                      {selectedCall.elevenLabsSummary && (
+                        <div>
+                          <h4 className="text-sm font-medium mb-1">AI-Zusammenfassung</h4>
+                          <p className="text-sm text-muted-foreground">{selectedCall.elevenLabsSummary}</p>
+                        </div>
+                      )}
+
+                      {/* ElevenLabs Data Collection */}
+                      {selectedCall.elevenLabsData && Object.keys(selectedCall.elevenLabsData).length > 0 && (
+                        <div>
+                          <h4 className="text-sm font-medium mb-2">Erhobene Daten</h4>
+                          <div className="space-y-2">
+                            {Object.entries(selectedCall.elevenLabsData).map(([key, entry]) => (
+                              <div key={key} className="bg-muted/50 rounded-md p-2.5">
+                                <div className="flex items-baseline gap-2">
+                                  <span className="text-sm font-medium">{key}:</span>
+                                  <span className="text-sm text-muted-foreground">{entry.value}</span>
+                                </div>
+                                {entry.rationale && (
+                                  <p className="text-xs text-muted-foreground/70 mt-0.5 italic">
+                                    {entry.rationale}
                                   </p>
                                 )}
                               </div>
-                            </div>
-                          ))}
+                            ))}
+                          </div>
                         </div>
-                      </div>
-                    )}
-                  </CardContent>
-                </Card>
-              </div>
-            </div>
+                      )}
+
+                      {/* Agent Notes */}
+                      {selectedCall.agentNotes && (
+                        <div>
+                          <h4 className="text-sm font-medium mb-1">Agenten-Notizen</h4>
+                          <p className="text-sm text-muted-foreground">{selectedCall.agentNotes}</p>
+                        </div>
+                      )}
+
+                      {/* Meeting date */}
+                      {selectedCall.meetingDate && (
+                        <div className="flex items-center gap-1.5 text-sm text-green-700">
+                          <Calendar className="h-3.5 w-3.5" />
+                          Termin: {formatDateTime(selectedCall.meetingDate)}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                ) : null}
+              </DialogContent>
+            </Dialog>
           </div>
         </div>
       </main>

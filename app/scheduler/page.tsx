@@ -32,6 +32,9 @@ import {
   Users,
   Trash2,
   Loader2,
+  Play,
+  Pause,
+  CheckCircle2,
 } from "lucide-react";
 import { toast } from "components/toast/use-toast";
 import { cn } from "lib/utils";
@@ -39,6 +42,7 @@ import {
   fetchBatches,
   fetchAgents,
   createBatch,
+  updateBatch,
   deleteBatch,
   type BatchDTO,
   type AgentDTO,
@@ -235,6 +239,7 @@ export default function SchedulerPage() {
                       <TableHead className="text-right">Kontakte</TableHead>
                       <TableHead>Fortschritt</TableHead>
                       <TableHead>Erstellt</TableHead>
+                      <TableHead>Aktionen</TableHead>
                       <TableHead className="w-[50px]" />
                     </TableRow>
                   </TableHeader>
@@ -286,6 +291,47 @@ export default function SchedulerPage() {
                           </TableCell>
                           <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
                             {new Date(batch.createdAt).toLocaleDateString("de-DE")}
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex items-center gap-1">
+                              {(batch.status === "pending" || batch.status === "paused") && (
+                                <Button
+                                  size="sm"
+                                  className="h-7 text-xs bg-green-600 hover:bg-green-700 text-white"
+                                  onClick={async (e) => {
+                                    e.preventDefault();
+                                    await updateBatch(batch.id, { status: "running" });
+                                    setBatches((prev) => prev.map((b) => b.id === batch.id ? { ...b, status: "running" } : b));
+                                    toast({ title: batch.status === "paused" ? "Stapel fortgesetzt" : "Stapel gestartet" });
+                                  }}
+                                >
+                                  <Play className="h-3 w-3 mr-1" />
+                                  {batch.status === "paused" ? "Fortsetzen" : "Starten"}
+                                </Button>
+                              )}
+                              {batch.status === "running" && (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-7 text-xs border-yellow-400 text-yellow-700 hover:bg-yellow-50"
+                                  onClick={async (e) => {
+                                    e.preventDefault();
+                                    await updateBatch(batch.id, { status: "paused" });
+                                    setBatches((prev) => prev.map((b) => b.id === batch.id ? { ...b, status: "paused" } : b));
+                                    toast({ title: "Stapel pausiert" });
+                                  }}
+                                >
+                                  <Pause className="h-3 w-3 mr-1" />
+                                  Pausieren
+                                </Button>
+                              )}
+                              {batch.status === "completed" && (
+                                <span className="flex items-center gap-1 text-xs text-green-600">
+                                  <CheckCircle2 className="h-3.5 w-3.5" />
+                                  Fertig
+                                </span>
+                              )}
+                            </div>
                           </TableCell>
                           <TableCell>
                             <Button

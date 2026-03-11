@@ -6,7 +6,6 @@ import { SidebarLayout } from "components/sidebar/sidebar-layout";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-// Slider removed — agent count is now in Settings
 import { cn, formatPhoneDisplay } from "lib/utils";
 import { useToast } from "components/toast/use-toast";
 import {
@@ -24,7 +23,6 @@ import {
   CheckCircle2,
   ExternalLink,
   Trash2,
-  Headphones,
   User,
   Clock,
   LogIn,
@@ -36,19 +34,15 @@ import {
   getCallRecords,
   getActiveCalls,
   setActiveCalls,
-  getScheduledBatches,
   getOperatorAvailability,
   setOperatorAvailability,
   generateId,
   addCallRecord,
-  updateScheduledBatch,
-  deleteScheduledBatch,
 } from "lib/store";
-import type { ActiveCall, CallRecord, ScheduledBatch } from "lib/types";
-import { fetchContacts, fetchCalls, fetchOperator, updateOperator, fetchSettings, type ContactDTO, type CallDTO } from "@/lib/api-client";
+import type { ActiveCall, CallRecord } from "lib/types";
+import { fetchContacts, fetchCalls, updateCall, fetchOperator, updateOperator, fetchBatches, updateBatch, deleteBatch, fetchSettings, fetchAgents, type ContactDTO, type CallDTO, type BatchDTO } from "@/lib/api-client";
 import {
   sampleTranscripts,
-  type TranscriptLine,
   TRANSCRIPT_NO_ANSWER,
   TRANSCRIPT_VOICEMAIL,
   TRANSCRIPT_BUSY,
@@ -56,13 +50,7 @@ import {
 } from "lib/sample-transcripts";
 import {
   getMockMode,
-  updateCallRecord,
 } from "lib/store";
-import {
-  makeOutboundCall,
-  fetchConversation,
-  isElevenLabsConfigured,
-} from "lib/elevenlabs";
 
 function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60);
@@ -92,31 +80,20 @@ export default function Page() {
   const [callRecords, setCallRecords] = useState<CallRecord[]>([]);
   const [contactCount, setContactCount] = useState(0);
   const [allContacts, setAllContacts] = useState<ContactDTO[]>([]);
-  const [batches, setBatches] = useState<ScheduledBatch[]>([]);
+  const [batches, setBatches] = useState<BatchDTO[]>([]);
   const [tick, setTick] = useState(0);
   const [agentCount, setAgentCount] = useState(2);
   const [queuePaused, setQueuePaused] = useState(false);
-  const [transferredCall, setTransferredCall] = useState<{
-    callId: string;
-    contactId: string;
-    contactName: string;
-    phone: string;
-    startedAt: string;
-    transcript: TranscriptLine[];
-  } | null>(null);
-  const [userOnCall, setUserOnCall] = useState(false);
+  // Transfer state is now driven by operator lock polling (isLocked / lockedBy)
+  // No local transferredCall state — the lock API is the source of truth
 
   const [mockMode, setMockModeState] = useState(true);
   const [recentCalls, setRecentCalls] = useState<CallDTO[]>([]);
 
-  // Live transcript state
-  const [liveTranscripts, setLiveTranscripts] = useState<Record<string, TranscriptLine[]>>({});
-  const transcriptTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>[]>>({});
   // Track ElevenLabs polling intervals for real calls
   const elevenLabsPollingRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
   const transcriptAssignedRef = useRef<Record<string, number>>({});
-  const prevStatusRef = useRef<Record<string, ActiveCall["status"]>>({});
-  const batchProgressRef = useRef<Record<string, number>>({}); // tracks index of next contact to call per batch
+  const [elevenLabsReady, setElevenLabsReady] = useState(true); // assume configured until proven otherwise
 
   // Load initial data - clear stale active calls on mount
   useEffect(() => {
@@ -153,14 +130,22 @@ export default function Page() {
       }
     }
     loadOperator();
-    setBatches(getScheduledBatches());
+    // Load batches from API (non-completed only)
+    fetchBatches({ limit: 100 })
+      .then((res) => setBatches(res.data.filter((b) => b.status !== "completed")))
+      .catch(() => {});
     setMockModeState(getMockMode());
 
-    // Load concurrent agents from settings
-    fetchSettings().then((res) => setAgentCount(res.data.concurrentAgents ?? 2)).catch(() => {});
+    // Load settings + agents to check ElevenLabs configuration
+    Promise.all([fetchSettings(), fetchAgents()]).then(([settingsRes, agentsRes]) => {
+      setAgentCount(settingsRes.data.concurrentAgents ?? 2);
+      const hasApiKey = !!settingsRes.data.apiKey;
+      const hasAgent = agentsRes.data.some((a) => a.agentId && a.agentPhoneNumberId);
+      setElevenLabsReady(hasApiKey && hasAgent);
+    }).catch(() => {});
 
-    // Load recent calls from API
-    fetchCalls({ limit: 5 }).then((res) => setRecentCalls(res.data)).catch(() => {});
+    // Load recent calls from API (exclude planned/not-yet-run calls)
+    fetchCalls({ limit: 20 }).then((res) => setRecentCalls(res.data.filter((c) => c.status !== "planned").slice(0, 5))).catch(() => {});
 
     // Listen for mock mode changes from sidebar
     const handler = (e: Event) => {
@@ -177,7 +162,7 @@ export default function Page() {
   // Poll for recent calls every 10 seconds
   useEffect(() => {
     const interval = setInterval(() => {
-      fetchCalls({ limit: 5 }).then((res) => setRecentCalls(res.data)).catch(() => {});
+      fetchCalls({ limit: 20 }).then((res) => setRecentCalls(res.data.filter((c) => c.status !== "planned").slice(0, 5))).catch(() => {});
     }, 10000);
     return () => clearInterval(interval);
   }, []);
@@ -210,86 +195,65 @@ export default function Page() {
   }, []);
 
   // Helper: start ElevenLabs polling for a real call
-  const startElevenLabsPolling = useCallback((conversationId: string, callRecordId: string, callId: string, contactName: string) => {
+  const startElevenLabsPolling = useCallback((conversationId: string, callRecordId: string, activeCallId: string, contactName: string) => {
     if (elevenLabsPollingRef.current[conversationId]) return;
 
     const poll = async () => {
-      const detail = await fetchConversation(conversationId);
-      if (!detail) return;
+      try {
+        const res = await fetch(`/api/calls/${callRecordId}/poll`, { method: "POST" });
+        const result = await res.json();
+        if (!res.ok) return;
 
-      // Update live transcript display
-      if (detail.transcript && detail.transcript.length > 0) {
-        setLiveTranscripts((prev) => ({
-          ...prev,
-          [callId]: detail.transcript!.map((t) => ({
-            speaker: (t.role === "agent" || t.role === "ai" ? "agent" : "contact") as "agent" | "contact",
-            text: t.message,
-            delayMs: 0,
-          })),
-        }));
-      }
+        const data = result.data;
 
-      if (detail.status === "done" || detail.status === "failed") {
-        // Stop polling
-        if (elevenLabsPollingRef.current[conversationId]) {
-          clearInterval(elevenLabsPollingRef.current[conversationId]);
-          delete elevenLabsPollingRef.current[conversationId];
-        }
+        if (!data.polling) {
+          // Call is done — stop polling
+          if (elevenLabsPollingRef.current[conversationId]) {
+            clearInterval(elevenLabsPollingRef.current[conversationId]);
+            delete elevenLabsPollingRef.current[conversationId];
+          }
 
-        const duration = detail.call_duration_secs ?? 0;
+          const duration = data.duration ?? 0;
+          const callStatus = data.status === "failed" ? "failed" as const : "completed" as const;
 
-        // Update call record with transcript data
-        updateCallRecord(callRecordId, {
-          endedAt: new Date().toISOString(),
-          duration,
-          status: "completed",
-          outcome: "answered",
-          transcript: detail.transcript?.map((t) => `${t.role}: ${t.message}`).join("\n"),
-          summary: detail.analysis?.summary || `Anruf mit ${contactName}`,
-          elevenLabsTranscript: detail.transcript,
-          elevenLabsSummary: detail.analysis?.summary,
-          elevenLabsData: detail.analysis?.data_collection_results,
-        });
-        setCallRecords((prev) =>
-          prev.map((r) =>
-            r.id === callRecordId
-              ? {
-                  ...r,
-                  endedAt: new Date().toISOString(),
-                  duration,
-                  status: "completed" as const,
-                  outcome: "answered" as const,
-                  summary: detail.analysis?.summary || `Anruf mit ${contactName}`,
-                  elevenLabsTranscript: detail.transcript,
-                  elevenLabsSummary: detail.analysis?.summary,
-                  elevenLabsData: detail.analysis?.data_collection_results,
-                }
-              : r
-          )
-        );
-
-        // Mark active call as completed
-        setActiveCallsState((p) => {
-          const next = p.map((c) =>
-            c.id === callId ? { ...c, status: "completed" as const, duration } : c
+          // Update local call records state
+          setCallRecords((prev) =>
+            prev.map((r) =>
+              r.id === callRecordId
+                ? {
+                    ...r,
+                    endedAt: new Date().toISOString(),
+                    duration,
+                    status: callStatus,
+                    outcome: callStatus === "completed" ? "answered" as const : undefined,
+                    summary: data.summary || `Anruf mit ${contactName}`,
+                    elevenLabsTranscript: data.transcript,
+                    elevenLabsSummary: data.summary,
+                  }
+                : r
+            )
           );
-          setActiveCalls(next);
-          return next;
-        });
 
-        // Remove from active calls after 4s
-        setTimeout(() => {
+          // Mark active call as completed/failed
           setActiveCallsState((p) => {
-            const next = p.filter((c) => c.id !== callId);
+            const next = p.map((c) =>
+              c.id === activeCallId ? { ...c, status: callStatus, duration } : c
+            );
             setActiveCalls(next);
             return next;
           });
-          setLiveTranscripts((prev) => {
-            const copy = { ...prev };
-            delete copy[callId];
-            return copy;
-          });
-        }, 4000);
+
+          // Remove from active calls after 4s
+          setTimeout(() => {
+            setActiveCallsState((p) => {
+              const next = p.filter((c) => c.id !== activeCallId);
+              setActiveCalls(next);
+              return next;
+            });
+          }, 4000);
+        }
+      } catch {
+        // Network error — will retry on next interval
       }
     };
 
@@ -308,54 +272,113 @@ export default function Page() {
     }, 10 * 60 * 1000);
   }, []);
 
+  // Poll batches from API every 10 seconds to get updated counts and statuses
+  useEffect(() => {
+    const pollBatches = async () => {
+      try {
+        const res = await fetchBatches({ limit: 100 });
+        setBatches(res.data.filter((b) => b.status !== "completed"));
+      } catch {
+        // ignore
+      }
+    };
+    const interval = setInterval(pollBatches, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Cache of planned calls per batch (fetched from API)
+  const batchCallsCache = useRef<Record<string, { contactId: string; callId: string }[]>>({});
+  const spawnLockRef = useRef(false); // prevent concurrent spawns
+
   // Process running batches - auto-spawn calls on free agent slots
   useEffect(() => {
     const runningBatches = batches.filter((b) => b.status === "running");
-    if (runningBatches.length === 0 || queuePaused || !isAvailable) return;
+    if (runningBatches.length === 0 || queuePaused) return;
 
-    const interval = setInterval(() => {
-      // Don't spawn if queue got paused or operator went unavailable
-      if (queuePaused || !isAvailable) return;
+    const spawnCalls = async () => {
+      // Prevent concurrent runs
+      if (spawnLockRef.current) return;
+      spawnLockRef.current = true;
 
-      setActiveCallsState((prevCalls) => {
-        const busyCalls = prevCalls.filter(
+      try {
+        // 1. Check operator availability via API
+        let operatorOk = false;
+        try {
+          const opRes = await fetchOperator();
+          const op = opRes.data;
+          setIsAvailable(op.available);
+          setIsLocked(op.locked);
+          setLockedBy(op.lockedBy ?? null);
+          setLockedAt(op.lockedAt ? new Date(op.lockedAt) : null);
+          operatorOk = op.available && !op.locked;
+        } catch {
+          // If API fails, use local state
+          operatorOk = isAvailable && !isLocked;
+        }
+        if (!operatorOk || queuePaused) return;
+
+        // 2. Count busy slots
+        const currentCalls = getActiveCalls();
+        const busyCalls = currentCalls.filter(
           (c) => c.status !== "completed" && c.status !== "failed"
         );
-        if (busyCalls.length >= agentCount) return prevCalls;
+        if (busyCalls.length >= agentCount) return;
 
         const contactMap = new Map(allContacts.map((c) => [c.id, c]));
 
         for (const batch of runningBatches) {
-          const idx = batchProgressRef.current[batch.id] ?? 0;
-          if (idx >= batch.contactIds.length) {
-            if (batch.status !== "completed") {
-              updateScheduledBatch(batch.id, { status: "completed", completedCalls: batch.totalCalls });
-              setBatches((prev) =>
-                prev.map((b) => b.id === batch.id ? { ...b, status: "completed", completedCalls: batch.totalCalls } : b)
-              );
+          // Check slot availability again inside loop
+          const currentBusy = getActiveCalls().filter(
+            (c) => c.status !== "completed" && c.status !== "failed"
+          );
+          if (currentBusy.length >= agentCount) break;
+
+          // 3. Fetch planned calls for this batch (cache them)
+          if (!batchCallsCache.current[batch.id]) {
+            try {
+              const callsRes = await fetchCalls({ batchId: batch.id, status: "planned", limit: 500 });
+              batchCallsCache.current[batch.id] = callsRes.data.map((c) => ({
+                contactId: c.contactId,
+                callId: c.id,
+              }));
+            } catch {
+              continue;
             }
+          }
+
+          const plannedCalls = batchCallsCache.current[batch.id];
+          if (!plannedCalls || plannedCalls.length === 0) {
+            // No more planned calls — mark batch completed
+            updateBatch(batch.id, { status: "completed" }).catch(() => {});
+            setBatches((prev) => prev.filter((b) => b.id !== batch.id));
+            delete batchCallsCache.current[batch.id];
             continue;
           }
 
-          const contactId = batch.contactIds[idx];
-          const contact = contactMap.get(contactId);
+          // Pick the next planned call
+          const nextPlanned = plannedCalls.shift()!;
+          // Persist the shift so we don't re-pick it
+          batchCallsCache.current[batch.id] = plannedCalls;
+
+          const contact = contactMap.get(nextPlanned.contactId);
           if (!contact) {
-            batchProgressRef.current[batch.id] = idx + 1;
+            // Contact not found, skip
             continue;
           }
 
-          const usedSlots = new Set(busyCalls.map((c) => c.agentId));
+          // Find free agent slot
+          const usedSlots = new Set(currentBusy.map((c) => c.agentId));
           let slot = 0;
           for (let i = 1; i <= agentCount; i++) {
             if (!usedSlots.has(i)) { slot = i; break; }
           }
-          if (slot === 0) return prevCalls;
+          if (slot === 0) break;
 
           const callId = generateId();
           const contactName = `${contact.firstName} ${contact.lastName}`;
           const newCall: ActiveCall = {
             id: callId,
-            contactId,
+            contactId: contact.id,
             contactName,
             phone: contact.phone,
             status: "ringing",
@@ -364,15 +387,16 @@ export default function Page() {
             agentId: slot,
           };
 
-          batchProgressRef.current[batch.id] = idx + 1;
-          const newCompleted = idx + 1;
-          updateScheduledBatch(batch.id, { completedCalls: newCompleted });
+          const newCompleted = batch.completedCalls + 1;
           setBatches((prev) =>
             prev.map((b) => b.id === batch.id ? { ...b, completedCalls: newCompleted } : b)
           );
 
-          const updated = [...prevCalls, newCall];
-          setActiveCalls(updated);
+          setActiveCallsState((prev) => {
+            const updated = [...prev, newCall];
+            setActiveCalls(updated);
+            return updated;
+          });
 
           if (mockMode) {
             // ===== MOCK MODE: simulate with sample transcripts =====
@@ -417,31 +441,56 @@ export default function Page() {
 
             if (isTransfer) {
               const transferAfterMs = (scriptDurationSec + 3) * 1000;
-              setTimeout(() => {
+              const mockConvId = `conv_mock_${callId}`;
+              setTimeout(async () => {
                 setActiveCallsState((p) => {
                   const next = p.map((c) =>
-                    c.id === callId ? { ...c, status: "transferring" as const } : c
+                    c.id === callId ? { ...c, status: "transferring" as const, conversationId: mockConvId } : c
                   );
                   setActiveCalls(next);
                   return next;
                 });
+
+                try {
+                  await updateOperator({ locked: true, lockedBy: mockConvId });
+                } catch {
+                  // operator lock API not available
+                }
                 setQueuePaused(true);
-                setTransferredCall({
-                  callId, contactId, contactName,
-                  phone: contact.phone,
+
+                const transferRecord: CallRecord = {
+                  id: generateId(), contactId: contact.id,
                   startedAt: newCall.startedAt,
-                  transcript: sampleTranscripts[TRANSCRIPT_TRANSFER],
-                });
+                  endedAt: new Date().toISOString(),
+                  duration: scriptDurationSec,
+                  status: "transferred", outcome: "callback-requested",
+                  summary: `Weiterleitung: ${contactName} — Kunde möchte mit Mensch sprechen`,
+                };
+                addCallRecord(transferRecord);
+                setCallRecords((prev) => [transferRecord, ...prev]);
+                updateCall(nextPlanned.callId, {
+                  status: "transferred", outcome: "callback-requested",
+                  duration: scriptDurationSec,
+                }).catch(() => {});
+
+                setTimeout(() => {
+                  setActiveCallsState((p) => {
+                    const next = p.filter((c) => c.id !== callId);
+                    setActiveCalls(next);
+                    return next;
+                  });
+                }, 4000);
+
                 toast({
-                  title: "Anruf an Sie weitergeleitet!",
-                  description: `${contactName} möchte mit einem Menschen sprechen. Warteschlange pausiert.`,
+                  title: "Anruf weitergeleitet",
+                  description: `${contactName} — Operator blockiert durch ${mockConvId}`,
                 });
               }, transferAfterMs);
             } else {
               const completeAfterMs = (scriptDurationSec + 3) * 1000;
               setTimeout(() => {
                 const record: CallRecord = {
-                  id: generateId(), contactId,
+                  id: generateId(), contactId: contact.id,
                   startedAt: newCall.startedAt,
                   endedAt: new Date().toISOString(),
                   duration: scriptDurationSec,
@@ -450,6 +499,10 @@ export default function Page() {
                 };
                 addCallRecord(record);
                 setCallRecords((prev) => [record, ...prev]);
+                updateCall(nextPlanned.callId, {
+                  status: "completed", outcome,
+                  duration: scriptDurationSec,
+                }).catch(() => {});
 
                 setActiveCallsState((p) => {
                   const next = p.map((c) =>
@@ -465,68 +518,36 @@ export default function Page() {
                     setActiveCalls(next);
                     return next;
                   });
-                  setLiveTranscripts((prev) => {
-                    const copy = { ...prev };
-                    delete copy[callId];
-                    return copy;
-                  });
                 }, 4000);
               }, completeAfterMs);
             }
           } else {
-            // ===== LIVE MODE: call ElevenLabs API =====
-            const recordId = generateId();
-            const record: CallRecord = {
-              id: recordId, contactId,
-              startedAt: newCall.startedAt,
-              status: "in-progress",
-              summary: `Anruf an ${contactName}...`,
-            };
-            addCallRecord(record);
-            setCallRecords((prev) => [record, ...prev]);
-
-            // Transition to in-progress immediately
-            setTimeout(() => {
-              setActiveCallsState((p) => {
-                const next = p.map((c) =>
-                  c.id === callId ? { ...c, status: "in-progress" as const } : c
-                );
-                setActiveCalls(next);
-                return next;
-              });
-            }, 2000);
-
-            // Fire the API call async
-            makeOutboundCall(
-              contact.phone,
-              contact,
-            ).then((result) => {
-              if (result.success && result.conversationId) {
-                // Store conversationId
-                updateCallRecord(recordId, { conversationId: result.conversationId });
-                setCallRecords((prev) =>
-                  prev.map((r) =>
-                    r.id === recordId ? { ...r, conversationId: result.conversationId } : r
-                  )
-                );
+            // ===== LIVE MODE: delegate to backend =====
+            fetch("/api/calls/start", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ callId: nextPlanned.callId, contactId: contact.id }),
+            }).then(async (res) => {
+              const result = await res.json();
+              if (res.ok) {
+                // Backend started the call and updated the DB
+                const convId = result.data?.conversationId;
+                setActiveCallsState((p) => {
+                  const next = p.map((c) =>
+                    c.id === callId ? { ...c, status: "in-progress" as const, ...(convId ? { conversationId: convId } : {}) } : c
+                  );
+                  setActiveCalls(next);
+                  return next;
+                });
                 toast({
                   title: "Anruf gestartet (LIVE)",
-                  description: `${contactName} — ${result.conversationId}`,
+                  description: `${contactName} — ${convId || result.data?.callId}`,
                 });
-                // Start polling for transcript
-                startElevenLabsPolling(result.conversationId, recordId, callId, contactName);
+                // Start polling backend for call status updates
+                startElevenLabsPolling(convId || nextPlanned.callId, nextPlanned.callId, callId, contactName);
               } else {
-                // API error — mark call as failed
-                updateCallRecord(recordId, {
-                  status: "failed",
-                  endedAt: new Date().toISOString(),
-                  summary: `Fehler: ${result.error}`,
-                });
-                setCallRecords((prev) =>
-                  prev.map((r) =>
-                    r.id === recordId ? { ...r, status: "failed" as const, summary: `Fehler: ${result.error}` } : r
-                  )
-                );
+                // Backend returned error
+                const errMsg = result.error || "Unbekannter Fehler";
                 setActiveCallsState((p) => {
                   const next = p.map((c) =>
                     c.id === callId ? { ...c, status: "failed" as const } : c
@@ -536,7 +557,7 @@ export default function Page() {
                 });
                 toast({
                   title: "Anruf fehlgeschlagen",
-                  description: result.error,
+                  description: errMsg,
                   variant: "destructive",
                 });
                 setTimeout(() => {
@@ -550,69 +571,17 @@ export default function Page() {
             });
           }
 
-          return updated;
+          // Only spawn one call per interval tick
+          break;
         }
-
-        return prevCalls;
-      });
-    }, 5000);
-
-    return () => clearInterval(interval);
-  }, [batches, queuePaused, isAvailable, agentCount, mockMode, startElevenLabsPolling, allContacts]);
-
-  // Start transcript reveal when a call transitions to in-progress (MOCK MODE ONLY)
-  useEffect(() => {
-    for (const call of activeCalls) {
-      const prevStatus = prevStatusRef.current[call.id];
-      // Detect ringing -> in-progress transition
-      if (prevStatus === "ringing" && call.status === "in-progress") {
-        // Only start mock transcript timers in mock mode and if not already running
-        if (mockMode && !transcriptTimersRef.current[call.id] && transcriptAssignedRef.current[call.id] != null) {
-          const scriptIndex = transcriptAssignedRef.current[call.id];
-          const script = sampleTranscripts[scriptIndex];
-          const timers: ReturnType<typeof setTimeout>[] = [];
-          let cumulativeDelay = 0;
-
-          for (let i = 0; i < script.length; i++) {
-            cumulativeDelay += script[i].delayMs;
-            const lineIndex = i;
-            const timer = setTimeout(() => {
-              setLiveTranscripts((prev) => {
-                const existing = prev[call.id] || [];
-                return { ...prev, [call.id]: [...existing, script[lineIndex]] };
-              });
-            }, cumulativeDelay);
-            timers.push(timer);
-          }
-          transcriptTimersRef.current[call.id] = timers;
-        }
-      }
-
-      // Clean up timers when call completes
-      if (
-        (call.status === "completed" || call.status === "failed") &&
-        transcriptTimersRef.current[call.id]
-      ) {
-        for (const timer of transcriptTimersRef.current[call.id]) {
-          clearTimeout(timer);
-        }
-        delete transcriptTimersRef.current[call.id];
-      }
-
-      prevStatusRef.current[call.id] = call.status;
-    }
-  }, [activeCalls, mockMode]);
-
-  // Cleanup all transcript timers on unmount
-  useEffect(() => {
-    return () => {
-      for (const callId of Object.keys(transcriptTimersRef.current)) {
-        for (const timer of transcriptTimersRef.current[callId]) {
-          clearTimeout(timer);
-        }
+      } finally {
+        spawnLockRef.current = false;
       }
     };
-  }, []);
+
+    const interval = setInterval(spawnCalls, 5000);
+    return () => clearInterval(interval);
+  }, [batches, queuePaused, isAvailable, isLocked, agentCount, mockMode, startElevenLabsPolling, allContacts, toast]);
 
   // Recalculate durations on tick for active calls
   const getCallDuration = useCallback(
@@ -809,56 +778,22 @@ export default function Page() {
           setActiveCalls(next);
           return next;
         });
-        setLiveTranscripts((prev) => {
-          const copy = { ...prev };
-          delete copy[callId];
-          return copy;
-        });
       }, 4000);
     }, completeAfterMs);
   };
 
-  // Handle end of transferred call
-  const handleEndTransfer = (outcome: "answered" | "meeting-booked" | "callback-requested") => {
-    if (!transferredCall) return;
-    const { callId, contactId, contactName, startedAt } = transferredCall;
-    const duration = Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000);
-
-    const record: CallRecord = {
-      id: generateId(),
-      contactId,
-      startedAt,
-      endedAt: new Date().toISOString(),
-      duration,
-      status: "transferred",
-      outcome,
-      summary: `Transferred to human: ${contactName} - ${outcome.replace("-", " ")}`,
-      meetingBooked: outcome === "meeting-booked",
-      meetingDate: outcome === "meeting-booked" ? new Date(Date.now() + 7 * 86400000).toISOString() : undefined,
-    };
-    addCallRecord(record);
-    setCallRecords((prev) => [record, ...prev]);
-
-    // Remove from active calls
-    setActiveCallsState((prev) => {
-      const next = prev.filter((c) => c.id !== callId);
-      setActiveCalls(next);
-      return next;
-    });
-    setLiveTranscripts((prev) => {
-      const copy = { ...prev };
-      delete copy[callId];
-      return copy;
-    });
-
-    setTransferredCall(null);
-    setUserOnCall(false);
-    setQueuePaused(false);
-
-    toast({
-      title: "Weiterleitung abgeschlossen",
-      description: `Anruf mit ${contactName} beendet. Warteschlange fortgesetzt.`,
-    });
+  // Unlock operator (dismiss block)
+  const handleUnlockOperator = async () => {
+    try {
+      await updateOperator({ locked: false });
+      setIsLocked(false);
+      setLockedBy(null);
+      setLockedAt(null);
+      setQueuePaused(false);
+      toast({ title: "Operator entsperrt", description: "Warteschlange fortgesetzt." });
+    } catch {
+      toast({ title: "Fehler beim Entsperren", variant: "destructive" });
+    }
   };
 
   // Queue stats for visualization
@@ -867,43 +802,27 @@ export default function Page() {
     let totalQueued = 0;
     let totalProcessed = 0;
     let totalInBatches = 0;
-    const upcomingContacts: { contactId: string; name: string; phone: string; batchName: string }[] = [];
-    const cMap = new Map(allContacts.map((c) => [c.id, c]));
-
     for (const batch of runningBatches) {
-      const idx = batchProgressRef.current[batch.id] ?? 0;
-      totalProcessed += idx;
-      totalInBatches += batch.contactIds.length;
-      const remaining = batch.contactIds.length - idx;
+      totalProcessed += batch.completedCalls;
+      totalInBatches += batch.totalCalls;
+      const remaining = batch.totalCalls - batch.completedCalls;
       totalQueued += Math.max(0, remaining);
-      // Collect next 5 upcoming contacts across all batches
-      for (let i = idx; i < Math.min(idx + 5, batch.contactIds.length); i++) {
-        const c = cMap.get(batch.contactIds[i]);
-        if (c && upcomingContacts.length < 8) {
-          upcomingContacts.push({
-            contactId: c.id,
-            name: `${c.firstName} ${c.lastName}`,
-            phone: c.phone,
-            batchName: batch.name,
-          });
-        }
-      }
     }
 
     // Determine pause reason
     let pauseReason: string | null = null;
-    if (transferredCall) {
-      pauseReason = "Anruf an menschlichen Operator weitergeleitet";
+    if (isLocked) {
+      pauseReason = `Operator blockiert durch ${lockedBy ?? "unbekannt"}`;
     } else if (!isAvailable && runningBatches.length > 0) {
       pauseReason = "Operator ist nicht verfügbar";
     } else if (queuePaused) {
       pauseReason = "Warteschlange manuell pausiert";
     }
 
-    const isEffectivelyPaused = queuePaused || !isAvailable;
+    const isEffectivelyPaused = queuePaused || !isAvailable || isLocked;
 
-    return { totalQueued, totalProcessed, totalInBatches, runningBatches, upcomingContacts, pauseReason, isEffectivelyPaused };
-  }, [batches, tick, transferredCall, isAvailable, queuePaused, allContacts]);
+    return { totalQueued, totalProcessed, totalInBatches, runningBatches, pauseReason, isEffectivelyPaused };
+  }, [batches, tick, isLocked, lockedBy, isAvailable, queuePaused, allContacts]);
 
   // Contact lookup map for resolving names
   const contactsMap = useMemo(() => {
@@ -1020,7 +939,7 @@ export default function Page() {
             </div>
 
             {/* Live mode warning */}
-            {!mockMode && !isElevenLabsConfigured() && (
+            {!mockMode && !elevenLabsReady && (
               <div className="flex items-center gap-2 p-3 rounded-xl bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-400 text-sm">
                 <Activity className="h-4 w-4 shrink-0" />
                 <span>
@@ -1218,73 +1137,6 @@ export default function Page() {
               </CardContent>
             </Card>
 
-            {/* Transferred Call Card */}
-            {transferredCall && (
-              <Card className="border-2 border-orange-400 bg-orange-50 dark:bg-orange-950/20 shadow-lg shadow-orange-200/50 dark:shadow-orange-900/20">
-                <CardContent className="py-4">
-                  <div className="flex items-start gap-4">
-                    <div className="flex items-center justify-center h-12 w-12 rounded-full bg-orange-100 dark:bg-orange-900/40 shrink-0">
-                      <PhoneForwarded className="h-6 w-6 text-orange-600 dark:text-orange-400 animate-pulse" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        <h3 className="font-bold text-lg text-orange-800 dark:text-orange-300">Anruf an Sie weitergeleitet</h3>
-                        <span className="relative flex h-3 w-3">
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75" />
-                          <span className="relative inline-flex rounded-full h-3 w-3 bg-orange-500" />
-                        </span>
-                      </div>
-                      <p className="text-sm font-medium">{transferredCall.contactName}</p>
-                      <p className="text-xs text-muted-foreground">{formatPhoneDisplay(transferredCall.phone)}</p>
-                      <p className="text-xs text-orange-600 dark:text-orange-400 mt-1 font-medium">
-                        Warteschlange pausiert. {queueStats.totalQueued} Kontakte warten.
-                      </p>
-                      <div className="flex gap-2 mt-3">
-                        {!userOnCall ? (
-                          <Button
-                            size="sm"
-                            className="bg-orange-500 hover:bg-orange-600 text-white animate-pulse"
-                            onClick={() => setUserOnCall(true)}
-                          >
-                            <Headphones className="h-3 w-3 mr-1" />
-                            Anruf annehmen
-                          </Button>
-                        ) : (
-                          <>
-                            <Button
-                              size="sm"
-                              className="bg-green-600 hover:bg-green-700 text-white"
-                              onClick={() => handleEndTransfer("answered")}
-                            >
-                              <PhoneCall className="h-3 w-3 mr-1" />
-                              Anruf beendet
-                            </Button>
-                            <Button
-                              size="sm"
-                              className="bg-green-700 hover:bg-green-800 text-white"
-                              onClick={() => handleEndTransfer("meeting-booked")}
-                            >
-                              <CheckCircle2 className="h-3 w-3 mr-1" />
-                              Termin vereinbart
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="border-orange-300 text-orange-700"
-                              onClick={() => handleEndTransfer("callback-requested")}
-                            >
-                              <Phone className="h-3 w-3 mr-1" />
-                              Später zurückrufen
-                            </Button>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-            )}
-
             {/* Main 3-column layout: Active Calls (2 cols) + Queue/Batches (1 col) */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
               {/* Active Calls - 2 columns wide */}
@@ -1293,85 +1145,6 @@ export default function Page() {
                   <PhoneCall className="h-5 w-5 text-green-500" />
                   Aktive Anrufe ({agentCount} Agenten)
                 </h2>
-
-                {/* Operator Status Bar */}
-            <div className={cn(
-              "rounded-xl border px-4 py-3 flex items-center gap-3 transition-all",
-              userOnCall
-                ? "bg-green-50 border-green-300 dark:bg-green-950/30 dark:border-green-700"
-                : transferredCall
-                  ? "bg-orange-50 border-orange-300 dark:bg-orange-950/30 dark:border-orange-700"
-                  : "bg-muted/30 border-muted"
-            )}>
-              <div className={cn(
-                "flex items-center justify-center h-9 w-9 rounded-full shrink-0",
-                userOnCall
-                  ? "bg-green-100 dark:bg-green-900/40"
-                  : transferredCall
-                    ? "bg-orange-100 dark:bg-orange-900/40"
-                    : "bg-muted"
-              )}>
-                {userOnCall ? (
-                  <Headphones className="h-4 w-4 text-green-600 dark:text-green-400" />
-                ) : transferredCall ? (
-                  <PhoneForwarded className="h-4 w-4 text-orange-600 dark:text-orange-400 animate-pulse" />
-                ) : (
-                  <User className="h-4 w-4 text-muted-foreground" />
-                )}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className={cn(
-                    "text-sm font-semibold",
-                    userOnCall
-                      ? "text-green-800 dark:text-green-300"
-                      : transferredCall
-                        ? "text-orange-800 dark:text-orange-300"
-                        : "text-muted-foreground"
-                  )}>
-                    {userOnCall
-                      ? "Im Gespräch"
-                      : transferredCall
-                        ? "Weiterleitung eingehend"
-                        : "Bereit"}
-                  </span>
-                  {userOnCall && (
-                    <span className="relative flex h-2.5 w-2.5">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
-                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-green-500" />
-                    </span>
-                  )}
-                  {transferredCall && !userOnCall && (
-                    <span className="relative flex h-2.5 w-2.5">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75" />
-                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-orange-500" />
-                    </span>
-                  )}
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  {userOnCall
-                    ? `Im Gespräch mit ${transferredCall?.contactName} — ${formatPhoneDisplay(transferredCall?.phone ?? "")}`
-                    : transferredCall
-                      ? `${transferredCall.contactName} wartet — nehmen Sie den Anruf oben an`
-                      : "Keine aktiven Weiterleitungen. Sie sind für Übergaben verfügbar."}
-                </p>
-              </div>
-              {userOnCall && (
-                <Badge className="bg-green-100 text-green-800 border-green-200 text-xs">
-                  Warteschlange pausiert
-                </Badge>
-              )}
-              {transferredCall && !userOnCall && (
-                <Badge className="bg-orange-100 text-orange-800 border-orange-200 text-xs animate-pulse">
-                  Wartend
-                </Badge>
-              )}
-              {!transferredCall && !userOnCall && (
-                <Badge className="bg-muted text-muted-foreground text-xs">
-                  Bereitschaft
-                </Badge>
-              )}
-            </div>
 
                 {/* Agent Cards Grid */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 md:gap-4">
@@ -1423,33 +1196,11 @@ export default function Page() {
                             </p>
                           </div>
                         </div>
-                        {/* Live Transcript */}
-                        {liveTranscripts[call.id] && liveTranscripts[call.id].length > 0 && (
-                          <div
-                            className="mt-2 max-h-[160px] overflow-y-auto rounded-xl bg-black/[0.03] dark:bg-white/[0.04] px-3 py-2 scroll-smooth backdrop-blur-sm"
-                            ref={(el) => {
-                              if (el) el.scrollTop = el.scrollHeight;
-                            }}
-                          >
-                            {liveTranscripts[call.id].map((line, idx) => (
-                              <div
-                                key={idx}
-                                className="text-[11px] leading-4 font-mono animate-in fade-in slide-in-from-bottom-1 duration-300"
-                              >
-                                <span
-                                  className={cn(
-                                    "font-semibold",
-                                    line.speaker === "agent"
-                                      ? "text-orange-500 dark:text-orange-400"
-                                      : "text-green-600 dark:text-green-400"
-                                  )}
-                                >
-                                  {line.speaker === "agent" ? "Agent" : "Kontakt"}:
-                                </span>{" "}
-                                <span className="text-foreground/80">{line.text}</span>
-                              </div>
-                            ))}
-                          </div>
+                        {/* Conversation ID (shown on transfer) */}
+                        {call.conversationId && (
+                          <p className="mt-1 text-[11px] font-mono text-muted-foreground">
+                            {call.conversationId}
+                          </p>
                         )}
                         </>
                       ) : (
@@ -1544,51 +1295,13 @@ export default function Page() {
                     </div>
                   )}
 
-                  {/* Next in Queue */}
-                  {queueStats.upcomingContacts.length > 0 && (
-                    <div>
-                      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
-                        Nächste in der Warteschlange
-                      </p>
-                      <div className="space-y-1">
-                        {queueStats.upcomingContacts.map((uc, idx) => (
-                          <div
-                            key={uc.contactId + idx}
-                            className={cn(
-                              "flex items-center justify-between py-1.5 px-2 rounded text-sm",
-                              idx === 0 && !queueStats.isEffectivelyPaused
-                                ? "bg-green-50 dark:bg-green-950/20 border border-green-200 dark:border-green-800"
-                                : idx === 0
-                                ? "bg-orange-50 dark:bg-orange-950/20 border border-orange-200 dark:border-orange-800"
-                                : "bg-muted/30"
-                            )}
-                          >
-                            <div className="flex items-center gap-2 min-w-0">
-                              <span className="text-xs font-mono text-muted-foreground w-5 shrink-0">#{idx + 1}</span>
-                              <Link
-                                href={`/contacts/${uc.contactId}`}
-                                className="font-medium truncate hover:text-primary transition-colors text-sm"
-                              >
-                                {uc.name}
-                              </Link>
-                            </div>
-                            <div className="flex items-center gap-2 shrink-0">
-                              <span className="text-xs text-muted-foreground hidden sm:inline">{formatPhoneDisplay(uc.phone)}</span>
-                              <Badge className="text-[9px] bg-muted text-muted-foreground border-0 px-1.5">{uc.batchName}</Badge>
-                              {idx === 0 && !queueStats.isEffectivelyPaused && (
-                                <Badge className="text-[9px] bg-green-100 text-green-700 border-0 px-1.5 animate-pulse">
-                                  Nächste
-                                </Badge>
-                              )}
-                            </div>
-                          </div>
-                        ))}
-                        {queueStats.totalQueued > queueStats.upcomingContacts.length && (
-                          <p className="text-xs text-muted-foreground text-center py-1">
-                            +{queueStats.totalQueued - queueStats.upcomingContacts.length} weitere in der Warteschlange
-                          </p>
-                        )}
-                      </div>
+                  {/* Queue summary */}
+                  {queueStats.totalQueued > 0 && (
+                    <div className="flex items-center justify-between py-2 px-3 rounded-lg bg-muted/30 text-sm">
+                      <span className="text-muted-foreground">{queueStats.totalQueued} Anrufe in der Warteschlange</span>
+                      {queueStats.isEffectivelyPaused && (
+                        <Badge className="text-[10px] bg-orange-100 text-orange-700 border-0">Pausiert</Badge>
+                      )}
                     </div>
                   )}
 
@@ -1623,8 +1336,8 @@ export default function Page() {
                                     "bg-muted text-muted-foreground"
                                   )}>{batch.status}</Badge>
                                   <Button variant="ghost" size="icon" className="h-6 w-6 text-muted-foreground hover:text-red-600 hover:bg-red-100"
-                                    onClick={() => {
-                                      deleteScheduledBatch(batch.id);
+                                    onClick={async () => {
+                                      await deleteBatch(batch.id);
                                       setBatches((prev) => prev.filter((b) => b.id !== batch.id));
                                       toast({ title: "Stapel gelöscht" });
                                     }}
@@ -1632,7 +1345,7 @@ export default function Page() {
                                 </div>
                               </div>
                               <div className="flex items-center justify-between text-xs text-muted-foreground">
-                                <span>{batch.contactIds.length} Kontakte</span>
+                                <span>{batch.totalCalls} Kontakte</span>
                                 <span>{batch.completedCalls}/{batch.totalCalls}</span>
                               </div>
                               <div className="h-1.5 bg-muted rounded-full overflow-hidden">
@@ -1644,16 +1357,16 @@ export default function Page() {
                                 <div className="flex gap-1">
                                   {(batch.status === "pending" || batch.status === "paused") && (
                                     <Button size="sm" className="h-6 text-[11px] bg-green-600 hover:bg-green-700 text-white"
-                                      onClick={() => {
-                                        updateScheduledBatch(batch.id, { status: "running" });
+                                      onClick={async () => {
+                                        await updateBatch(batch.id, { status: "running" });
                                         setBatches((prev) => prev.map((b) => b.id === batch.id ? { ...b, status: "running" } : b));
                                       }}
                                     ><Play className="h-3 w-3 mr-1" />{batch.status === "paused" ? "Fortsetzen" : "Starten"}</Button>
                                   )}
                                   {batch.status === "running" && (
                                     <Button size="sm" variant="outline" className="h-6 text-[11px] border-yellow-400 text-yellow-700"
-                                      onClick={() => {
-                                        updateScheduledBatch(batch.id, { status: "paused" });
+                                      onClick={async () => {
+                                        await updateBatch(batch.id, { status: "paused" });
                                         setBatches((prev) => prev.map((b) => b.id === batch.id ? { ...b, status: "paused" } : b));
                                       }}
                                     ><Pause className="h-3 w-3 mr-1" />Pausieren</Button>

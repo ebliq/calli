@@ -120,6 +120,7 @@ export interface ActiveCall {
   startedAt: string;
   duration: number;
   agentId: number; // 1-4
+  conversationId?: string; // ElevenLabs conversation ID (shown on transfer)
 }
 
 export interface OperatorStatus {

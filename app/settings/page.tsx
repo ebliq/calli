@@ -36,30 +36,45 @@ import {
   Lock,
   Copy,
   Users,
+  Calendar,
+  Clock,
 } from "lucide-react";
+import { cn } from "lib/utils";
 import { toast } from "components/toast/use-toast";
 import {
-  saveContacts,
-  loadState,
-  saveState,
   clearAllData,
+  getMockMode,
+  setMockMode,
 } from "lib/store";
 import {
   fetchSettings, updateSettings,
   fetchCustomProperties, createCustomProperty, updateCustomProperty, deleteCustomProperty,
   fetchAgents, createAgent, updateAgent, deleteAgent,
+  eraseAllData,
   type SettingsDTO, type CustomPropertyDTO, type AgentDTO,
 } from "@/lib/api-client";
-import { sampleContacts, sampleCallRecords } from "lib/seed";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "components/ui/popover";
+import { Switch } from "components/ui/switch";
+import { createContacts } from "@/lib/api-client";
 
 const typeLabels: Record<string, string> = { string: "Text", number: "Zahl", boolean: "Ja/Nein" };
 
 export default function SettingsPage() {
   const [apiKey, setApiKeyState] = useState("");
   const [showKey, setShowKey] = useState(false);
+  const [activeTab, setActiveTab] = useState<"general" | "calendar">("general");
   const [operatorApiKey, setOperatorApiKeyState] = useState("");
   const [showOperatorKey, setShowOperatorKey] = useState(false);
   const [concurrentAgents, setConcurrentAgents] = useState(2);
+
+  // Working hours state
+  const [workStart, setWorkStart] = useState(9);
+  const [workEnd, setWorkEnd] = useState(17);
+  const [workDays, setWorkDays] = useState<number[]>([1, 2, 3, 4, 5]);
 
   // Custom Properties state
   const [customProps, setCustomProps] = useState<CustomPropertyDTO[]>([]);
@@ -67,6 +82,9 @@ export default function SettingsPage() {
   const [editingProp, setEditingProp] = useState<CustomPropertyDTO | null>(null);
   const [propName, setPropName] = useState("");
   const [propType, setPropType] = useState<"string" | "number" | "boolean">("string");
+
+  // Mock mode
+  const [mockEnabled, setMockEnabled] = useState(true);
 
   // Multi-Agent state
   const [agents, setAgents] = useState<AgentDTO[]>([]);
@@ -78,6 +96,7 @@ export default function SettingsPage() {
   const [agentMappings, setAgentMappings] = useState<{ contactField: string; apiVariable: string }[]>([]);
 
   useEffect(() => {
+    setMockEnabled(getMockMode());
     async function load() {
       try {
         const [settingsRes, propsRes, agentsRes] = await Promise.all([
@@ -88,6 +107,9 @@ export default function SettingsPage() {
         setApiKeyState(settingsRes.data.apiKey ?? "");
         setOperatorApiKeyState(settingsRes.data.operatorApiKey ?? "");
         setConcurrentAgents(settingsRes.data.concurrentAgents ?? 2);
+        setWorkStart(settingsRes.data.workingHoursStart ?? 9);
+        setWorkEnd(settingsRes.data.workingHoursEnd ?? 17);
+        setWorkDays(settingsRes.data.workingDays ?? [1, 2, 3, 4, 5]);
         setCustomProps(propsRes.data);
         setAgents(agentsRes.data);
       } catch (err) {
@@ -231,25 +253,80 @@ export default function SettingsPage() {
     setAgentMappings([]);
   }
 
-  const handleLoadSampleData = () => {
-    saveContacts(sampleContacts);
-    const state = loadState();
-    state.callRecords = sampleCallRecords;
-    saveState(state);
+  const handleToggleMock = (checked: boolean) => {
+    setMockEnabled(checked);
+    setMockMode(checked);
+    window.dispatchEvent(new CustomEvent("mockmode-changed", { detail: checked }));
     toast({
-      title: "Beispieldaten geladen",
-      description: `${sampleContacts.length} Kontakte und ${sampleCallRecords.length} Anrufprotokolle geladen.`,
+      title: checked ? "Mock-Modus aktiviert" : "Live-Modus aktiviert",
+      description: checked
+        ? "Anrufe werden simuliert."
+        : "Anrufe werden über die ElevenLabs API geführt.",
     });
   };
 
-  const handleClearAllData = () => {
-    if (window.confirm("Alle Daten unwiderruflich löschen?")) {
+  const [erasePopoverOpen, setErasePopoverOpen] = useState(false);
+  const [erasing, setErasing] = useState(false);
+  const [seeding, setSeeding] = useState(false);
+
+  const handleEraseAll = async () => {
+    setErasing(true);
+    try {
+      const res = await eraseAllData();
       clearAllData();
+      const total = Object.values(res.deleted).reduce((a, b) => a + b, 0);
       toast({
         title: "Alle Daten gelöscht",
-        description: "Alle Kontakte, Anrufe und Stapel wurden entfernt.",
+        description: `${total} Einträge wurden unwiderruflich entfernt.`,
       });
+      setErasePopoverOpen(false);
       window.location.reload();
+    } catch (err) {
+      toast({
+        title: "Fehler",
+        description: err instanceof Error ? err.message : "Unbekannter Fehler",
+        variant: "destructive",
+      });
+    } finally {
+      setErasing(false);
+    }
+  };
+
+  const handleSeedContacts = async () => {
+    setSeeding(true);
+    try {
+      const samples = Array.from({ length: 20 }, (_, i) => {
+        const firstNames = ["Anna", "Markus", "Sabine", "Thomas", "Julia", "Stefan", "Petra", "Klaus", "Monika", "Jens", "Laura", "Dirk", "Katrin", "Bernd", "Lisa", "Frank", "Eva", "Uwe", "Simone", "Ralf"];
+        const lastNames = ["Mueller", "Schmidt", "Schneider", "Fischer", "Weber", "Meyer", "Wagner", "Becker", "Hoffmann", "Schulz", "Koch", "Richter", "Wolf", "Klein", "Braun", "Hartmann", "Lange", "Werner", "Krause", "Lehmann"];
+        const companies = ["TechWerk GmbH", "Berlin Medizintechnik AG", "AutoParts24 GmbH", "CloudSoft Systems", "GreenEnergy AG", "SmartHome Solutions", "DataFlow GmbH", "BioTech Innovations", "LogiTrans AG", "FinanzPlus GmbH"];
+        const positions = ["Geschaeftsfuehrer", "Leiterin IT", "Vertriebsleiter", "CTO", "Marketing Manager", "Projektleiter", "Head of Sales", "Teamlead", "Berater", "Einkaufsleiter"];
+        const cities = ["Muenchen", "Berlin", "Hamburg", "Frankfurt", "Koeln", "Stuttgart", "Duesseldorf", "Leipzig", "Dresden", "Nuernberg"];
+        const statuses: Array<"new" | "contacted" | "scheduled" | "completed" | "no-answer" | "callback"> = ["new", "new", "new", "contacted", "scheduled", "no-answer"];
+        return {
+          firstName: firstNames[i],
+          lastName: lastNames[i],
+          phone: `+49 ${170 + (i % 10)} ${String(1000000 + Math.floor(Math.random() * 9000000))}`,
+          email: `${firstNames[i].toLowerCase()}.${lastNames[i].toLowerCase()}@example.de`,
+          company: companies[i % companies.length],
+          position: positions[i % positions.length],
+          city: cities[i % cities.length],
+          country: "Deutschland",
+          status: statuses[i % statuses.length],
+        };
+      });
+      const res = await createContacts(samples);
+      toast({
+        title: "Beispielkontakte erstellt",
+        description: `${res.count} Kontakte wurden angelegt.`,
+      });
+    } catch (err) {
+      toast({
+        title: "Fehler",
+        description: err instanceof Error ? err.message : "Unbekannter Fehler",
+        variant: "destructive",
+      });
+    } finally {
+      setSeeding(false);
     }
   };
 
@@ -269,6 +346,33 @@ export default function SettingsPage() {
               </p>
             </div>
 
+            {/* Tab Bar */}
+            <div className="flex gap-1 border-b mb-6">
+              <button
+                onClick={() => setActiveTab("general")}
+                className={cn(
+                  "px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors",
+                  activeTab === "general"
+                    ? "border-orange-500 text-orange-600"
+                    : "border-transparent text-muted-foreground hover:text-foreground"
+                )}
+              >
+                Allgemein
+              </button>
+              <button
+                onClick={() => setActiveTab("calendar")}
+                className={cn(
+                  "px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors",
+                  activeTab === "calendar"
+                    ? "border-orange-500 text-orange-600"
+                    : "border-transparent text-muted-foreground hover:text-foreground"
+                )}
+              >
+                Kalender
+              </button>
+            </div>
+
+            {activeTab === "general" && (<>
             {/* API Key */}
             <Card>
               <CardHeader>
@@ -611,6 +715,38 @@ export default function SettingsPage() {
               </DialogContent>
             </Dialog>
 
+            {/* Mock Mode */}
+            <Card className={mockEnabled ? "border-2 border-red-400 dark:border-red-600" : ""}>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Phone className="h-5 w-5" />
+                  Anruf-Modus
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex items-center justify-between rounded-lg border p-4">
+                  <div>
+                    <p className="font-medium text-sm">Mock-Calls (Demo-Modus)</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Wenn aktiviert, werden Anrufe simuliert. Im Live-Modus werden echte Anrufe über die ElevenLabs API geführt.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3 shrink-0">
+                    <Badge className={mockEnabled
+                      ? "bg-yellow-100 text-yellow-800 border-yellow-300"
+                      : "bg-red-100 text-red-800 border-red-300"
+                    }>
+                      {mockEnabled ? "DEMO" : "LIVE"}
+                    </Badge>
+                    <Switch
+                      checked={mockEnabled}
+                      onCheckedChange={handleToggleMock}
+                    />
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
             {/* Data Management */}
             <Card>
               <CardHeader>
@@ -622,14 +758,18 @@ export default function SettingsPage() {
               <CardContent className="space-y-4">
                 <div className="flex items-center justify-between rounded-lg border p-4">
                   <div>
-                    <p className="font-medium text-sm">Beispieldaten laden</p>
+                    <p className="font-medium text-sm">20 Beispielkontakte erstellen</p>
                     <p className="text-xs text-muted-foreground mt-0.5">
-                      Lädt {sampleContacts.length} Kontakte und Anrufprotokolle zum Testen.
+                      Erstellt 20 deutsche Beispielkontakte zum Testen.
                     </p>
                   </div>
-                  <Button variant="secondary" onClick={handleLoadSampleData}>
-                    <Database className="h-4 w-4 mr-2" />
-                    Laden
+                  <Button
+                    variant="secondary"
+                    onClick={handleSeedContacts}
+                    disabled={seeding}
+                  >
+                    <Plus className="h-4 w-4 mr-2" />
+                    {seeding ? "Erstelle..." : "Erstellen"}
                   </Button>
                 </div>
 
@@ -639,20 +779,202 @@ export default function SettingsPage() {
                       Alle Daten löschen
                     </p>
                     <p className="text-xs text-muted-foreground mt-0.5">
-                      Entfernt alle Kontakte, Anrufe und Stapel unwiderruflich.
+                      Entfernt alle Kontakte, Anrufe, Stapel, Agenten und Einstellungen unwiderruflich.
                     </p>
                   </div>
-                  <Button
-                    variant="outline"
-                    className="text-red-600 border-red-200 hover:bg-red-50 hover:text-red-700 dark:border-red-800 dark:hover:bg-red-950/30"
-                    onClick={handleClearAllData}
-                  >
-                    <Trash2 className="h-4 w-4 mr-2" />
-                    Löschen
-                  </Button>
+                  <Popover open={erasePopoverOpen} onOpenChange={setErasePopoverOpen}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        className="text-red-600 border-red-200 hover:bg-red-50 hover:text-red-700 dark:border-red-800 dark:hover:bg-red-950/30"
+                      >
+                        <Trash2 className="h-4 w-4 mr-2" />
+                        Löschen
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-80" align="end">
+                      <div className="space-y-3">
+                        <p className="text-sm font-semibold text-red-600">Sind Sie absolut sicher?</p>
+                        <p className="text-xs text-muted-foreground">
+                          Diese Aktion kann nicht rückgängig gemacht werden. Alle Kontakte, Anrufe, Stapel, Agenten und Einstellungen werden dauerhaft gelöscht.
+                        </p>
+                        <div className="flex justify-end gap-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setErasePopoverOpen(false)}
+                          >
+                            Abbrechen
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="destructive"
+                            onClick={handleEraseAll}
+                            disabled={erasing}
+                          >
+                            {erasing ? "Lösche..." : "Ja, alles löschen"}
+                          </Button>
+                        </div>
+                      </div>
+                    </PopoverContent>
+                  </Popover>
                 </div>
               </CardContent>
             </Card>
+            </>)}
+
+            {activeTab === "calendar" && (<>
+            {/* Working Hours */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Clock className="h-5 w-5" />
+                  Arbeitszeiten
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex items-center gap-3">
+                  <label className="text-sm font-medium">Arbeitszeit von</label>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={workStart}
+                    onChange={(e) => setWorkStart(Number(e.target.value))}
+                    className="w-20"
+                  />
+                  <label className="text-sm font-medium">bis</label>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={workEnd}
+                    onChange={(e) => setWorkEnd(Number(e.target.value))}
+                    className="w-20"
+                  />
+                  <span className="text-sm text-muted-foreground">Uhr</span>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Arbeitstage</label>
+                  <div className="flex gap-2">
+                    {[
+                      { label: "Mo", value: 1 },
+                      { label: "Di", value: 2 },
+                      { label: "Mi", value: 3 },
+                      { label: "Do", value: 4 },
+                      { label: "Fr", value: 5 },
+                      { label: "Sa", value: 6 },
+                      { label: "So", value: 0 },
+                    ].map((day) => (
+                      <label key={day.value} className="flex items-center gap-1.5 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={workDays.includes(day.value)}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setWorkDays([...workDays, day.value].sort());
+                            } else {
+                              setWorkDays(workDays.filter((d) => d !== day.value));
+                            }
+                          }}
+                          className="rounded border-gray-300"
+                        />
+                        {day.label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <Button
+                  onClick={async () => {
+                    await updateSettings({
+                      workingHoursStart: workStart,
+                      workingHoursEnd: workEnd,
+                      workingDays: workDays,
+                    });
+                    toast({
+                      title: "Arbeitszeiten gespeichert",
+                      description: "Die Arbeitszeiten wurden erfolgreich aktualisiert.",
+                    });
+                  }}
+                >
+                  Speichern
+                </Button>
+              </CardContent>
+            </Card>
+
+            {/* Calendar API */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Calendar className="h-5 w-5" />
+                  Kalender API für Agenten
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <p className="text-sm text-muted-foreground">
+                  Verwenden Sie den Operator API-Key um Termine über die API zu verwalten.
+                </p>
+
+                <div className="rounded-lg bg-muted/50 p-3 text-xs space-y-3">
+                  <p className="font-medium text-muted-foreground">Verfügbare Slots abfragen:</p>
+                  <code className="block text-[11px] break-all bg-background/50 rounded p-2">
+                    GET /api/appointments/public?from=2026-03-17T09:00:00Z&amp;to=2026-03-18T18:00:00Z&amp;duration=30<br />
+                    x-api-key: {showOperatorKey ? operatorApiKey : "op_••••••••"}
+                  </code>
+                  <p className="font-medium text-muted-foreground text-[11px]">Response:</p>
+                  <code className="block text-[11px] break-all bg-background/50 rounded p-2 whitespace-pre">
+{`{
+  "slots": [
+    { "start": "2026-03-17T09:00:00Z", "end": "2026-03-17T09:30:00Z" },
+    { "start": "2026-03-17T09:30:00Z", "end": "2026-03-17T10:00:00Z" }
+  ]
+}`}
+                  </code>
+
+                  <p className="font-medium text-muted-foreground">Termin erstellen:</p>
+                  <code className="block text-[11px] break-all bg-background/50 rounded p-2 whitespace-pre">
+{`POST /api/appointments/public
+x-api-key: ${showOperatorKey ? operatorApiKey : "op_••••••••"}
+Content-Type: application/json
+
+{
+  "title": "Beratungsgespräch",
+  "startTime": "2026-03-17T10:00:00Z",
+  "endTime": "2026-03-17T10:30:00Z",
+  "attendees": [{ "name": "Max Müller", "email": "max@example.de" }],
+  "notes": "Erstgespräch zum Thema KI-Telefonie"
+}`}
+                  </code>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowOperatorKey(!showOperatorKey)}
+                    className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
+                  >
+                    {showOperatorKey ? (
+                      <><EyeOff className="h-3 w-3" /> API-Key verbergen</>
+                    ) : (
+                      <><Eye className="h-3 w-3" /> API-Key anzeigen</>
+                    )}
+                  </button>
+                  {operatorApiKey && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(operatorApiKey);
+                        toast({ title: "Kopiert", description: "API-Key in die Zwischenablage kopiert." });
+                      }}
+                      className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
+                    >
+                      <Copy className="h-3 w-3" /> Kopieren
+                    </button>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+            </>)}
           </div>
         </div>
       </main>

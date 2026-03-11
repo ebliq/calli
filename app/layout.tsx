@@ -4,6 +4,7 @@ import { Inter } from "next/font/google";
 import { ClerkProvider } from "@clerk/nextjs";
 import { ThemeProvider } from "components/theme-provider";
 import { Toaster } from "components/toast/toaster";
+import { MockModeBorder } from "components/mock-mode-border";
 import "./globals.css";
 
 const inter = Inter({ subsets: ["latin"] });
@@ -31,6 +32,7 @@ export default function RootLayout({
             enableSystem
             disableTransitionOnChange
           >
+            <MockModeBorder />
             {children}
             <Toaster />
           </ThemeProvider>

@@ -14,6 +14,9 @@ export interface ISettings extends Document {
   customProperties: ICustomProperty[];
   mockMode: boolean;
   concurrentAgents: number;
+  workingHoursStart: number;
+  workingHoursEnd: number;
+  workingDays: number[];
 }
 
 const customPropertySchema = new Schema<ICustomProperty>({
@@ -31,6 +34,9 @@ const settingsSchema = new Schema<ISettings>(
     customProperties: { type: [customPropertySchema], default: [] },
     mockMode: { type: Boolean, default: true },
     concurrentAgents: { type: Number, default: 2, min: 1, max: 50 },
+    workingHoursStart: { type: Number, default: 9, min: 0, max: 23 },
+    workingHoursEnd: { type: Number, default: 17, min: 0, max: 23 },
+    workingDays: { type: [Number], default: [1, 2, 3, 4, 5] },
   },
   {
     timestamps: true,

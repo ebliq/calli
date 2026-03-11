@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { connectDB } from "@/lib/mongodb";
 import { Call } from "@/lib/models/call";
+import { Contact } from "@/lib/models/contact";
 
 // GET /api/calls — List calls with optional filters
 export async function GET(req: NextRequest) {
@@ -35,14 +36,41 @@ export async function GET(req: NextRequest) {
       Call.countDocuments(filter),
     ]);
 
+    // Collect unique contact IDs for batch lookup
+    const contactIds = [
+      ...new Set(
+        calls
+          .map((c) => (c as Record<string, unknown>).contactId)
+          .filter(Boolean)
+          .map(String)
+      ),
+    ];
+
+    // Batch-fetch contact names
+    const contactMap = new Map<string, string>();
+    if (contactIds.length > 0) {
+      const contacts = await Contact.find({ _id: { $in: contactIds } })
+        .select("firstName lastName")
+        .lean();
+      for (const ct of contacts) {
+        const rec = ct as Record<string, unknown>;
+        contactMap.set(
+          String(rec._id),
+          `${rec.firstName ?? ""} ${rec.lastName ?? ""}`.trim()
+        );
+      }
+    }
+
     const data = calls.map((c) => {
       const { _id, __v, ...rest } = c as Record<string, unknown>;
+      const cid = rest.contactId ? String(rest.contactId) : null;
       return {
         id: String(_id),
         ...rest,
-        contactId: rest.contactId ? String(rest.contactId) : null,
+        contactId: cid,
         batchId: rest.batchId ? String(rest.batchId) : null,
         calliAgentId: rest.calliAgentId ? String(rest.calliAgentId) : null,
+        contactName: cid ? contactMap.get(cid) : undefined,
       };
     });
 

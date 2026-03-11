@@ -137,6 +137,9 @@ export interface SettingsDTO {
   customProperties: CustomPropertyDTO[];
   mockMode: boolean;
   concurrentAgents: number;
+  workingHoursStart?: number;
+  workingHoursEnd?: number;
+  workingDays?: number[];
   createdAt: string;
   updatedAt: string;
 }
@@ -220,6 +223,7 @@ export async function deleteBatch(id: string): Promise<{ deleted: boolean; plann
 export interface CallDTO {
   id: string;
   contactId: string;
+  contactName?: string;
   batchId?: string | null;
   calliAgentId?: string | null;
   status: "planned" | "ringing" | "in-progress" | "completed" | "failed" | "transferred";
@@ -228,9 +232,26 @@ export interface CallDTO {
   endedAt?: string | null;
   duration?: number | null;
   summary?: string | null;
+  transcript?: string | null;
   conversationId?: string | null;
+  elevenLabsTranscript?: { role: string; message: string; time_in_call_secs?: number }[] | null;
+  elevenLabsSummary?: string | null;
+  elevenLabsData?: Record<string, { value: string; rationale: string }> | null;
+  agentNotes?: string | null;
+  meetingBooked?: boolean | null;
+  meetingDate?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CallDetailDTO extends CallDTO {
+  transcript?: string | null;
+  elevenLabsTranscript?: { role: string; message: string; time_in_call_secs?: number }[] | null;
+  elevenLabsSummary?: string | null;
+  elevenLabsData?: Record<string, { value: string; rationale: string }> | null;
+  agentNotes?: string | null;
+  meetingBooked?: boolean | null;
+  meetingDate?: string | null;
 }
 
 export interface CallListResponse {
@@ -252,6 +273,10 @@ export async function fetchCalls(params?: { contactId?: string; batchId?: string
 }
 
 export async function fetchCall(id: string): Promise<{ data: CallDTO }> {
+  return request(`/api/calls/${id}`);
+}
+
+export async function fetchCallDetail(id: string): Promise<{ data: CallDetailDTO }> {
   return request(`/api/calls/${id}`);
 }
 
@@ -281,4 +306,61 @@ export async function fetchOperator(): Promise<{ data: OperatorDTO }> {
 
 export async function updateOperator(data: Partial<OperatorDTO>): Promise<{ data: OperatorDTO }> {
   return request("/api/operator", { method: "PATCH", body: JSON.stringify(data) });
+}
+
+// ---- Data Management ----
+
+export async function eraseAllData(): Promise<{ deleted: Record<string, number> }> {
+  return request("/api/data/erase-all", { method: "DELETE" });
+}
+
+// ---- Appointments ----
+
+export interface AppointmentDTO {
+  id: string;
+  title: string;
+  startTime: string;
+  endTime: string;
+  attendees: { name: string; email: string }[];
+  notes?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AppointmentListResponse {
+  data: AppointmentDTO[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+
+export interface SlotDTO {
+  start: string;
+  end: string;
+}
+
+export async function fetchAppointments(params?: { from?: string; to?: string; page?: number; limit?: number }): Promise<AppointmentListResponse> {
+  const q = new URLSearchParams();
+  if (params?.from) q.set("from", params.from);
+  if (params?.to) q.set("to", params.to);
+  if (params?.page) q.set("page", String(params.page));
+  if (params?.limit) q.set("limit", String(params.limit));
+  return request(`/api/appointments?${q}`);
+}
+
+export async function fetchAppointment(id: string): Promise<{ data: AppointmentDTO }> {
+  return request(`/api/appointments/${id}`);
+}
+
+export async function createAppointment(data: Partial<AppointmentDTO>): Promise<{ data: AppointmentDTO }> {
+  return request("/api/appointments", { method: "POST", body: JSON.stringify(data) });
+}
+
+export async function updateAppointment(id: string, data: Partial<AppointmentDTO>): Promise<{ data: AppointmentDTO }> {
+  return request(`/api/appointments/${id}`, { method: "PATCH", body: JSON.stringify(data) });
+}
+
+export async function deleteAppointment(id: string): Promise<{ deleted: boolean }> {
+  return request(`/api/appointments/${id}`, { method: "DELETE" });
 }
