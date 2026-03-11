@@ -1,0 +1,52 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+{
+  "name": "poc-call-agent",
+
+  "build": {
+    "dockerfile": "dockerfile",
+    "context": ".."
+  },
+
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2.12.0": {
+      "version": "latest",
+      "moby": true
+    }
+    // "ghcr.io/devcontainers-extra/features/aws-cdk:2": {
+    //   "version": "2.1005.0"
+    // }
+  },
+  "forwardPorts": [3000],
+  "postCreateCommand": "pnpm config set store-dir /home/node/.pnpm-store",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "hbenl.vscode-test-explorer",
+        "orta.vscode-jest",
+        "openai.chatgpt"
+      ],
+      "settings": {
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "/bin/zsh"
+          }
+        },
+        "terminal.integrated.defaultProfile.linux": "zsh"
+      }
+    }
+  },
+  "containerEnv": {
+    "STARSHIP_CONFIG": "/home/node/.starship.toml"
+  },
+  "mounts": [
+    "source=${localEnv:HOME}/.ssh,target=/home/node/.ssh,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.zsh_history,target=/home/node/.zsh_history,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.zshrc,target=/home/node/.zshrc,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.config/starship.toml,target=/home/node/.starship.toml,type=bind,consistency=cached",
+    "source=/var/run/docker.sock,target=/var/run/docker-host.sock,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.aws,target=/home/node/.aws,type=bind,consistency=cached"
+  ],
+  "remoteUser": "node"
+}

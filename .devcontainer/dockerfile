@@ -1,0 +1,6 @@
+FROM mcr.microsoft.com/devcontainers/typescript-node:22-bookworm
+RUN curl -sS https://starship.rs/install.sh | sh -s -- -y
+RUN git clone https://github.com/zsh-users/zsh-autosuggestions /home/node/.oh-my-zsh/custom/plugins/zsh-autosuggestions
+RUN git clone https://github.com/zsh-users/zsh-syntax-highlighting.git /home/node/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting
+RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN wget -qO- https://get.pnpm.io/install.sh | ENV="$HOME/.bashrc" SHELL="$(which bash)" bash -
